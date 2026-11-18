@@ -45,7 +45,7 @@ import { fileURLToPath } from 'node:url';
 
 export const PACKAGE_ID = '@local/dsh-news';
 /** 代码版本：`/api/dsh-news/state` 会回传，用来判断宿主是否已加载新版。 */
-export const CODE_VERSION = '0.12.0';
+export const CODE_VERSION = '0.12.1';
 export const SECTION_NAME = 'plugin:dsh-news-digest';
 export const SECTION_ORDER = 160;
 
@@ -2904,31 +2904,59 @@ export function createRuntime(options = {}) {
     return /^[\w.-]+\/[\w.-]+$/.test(raw) ? raw : UPDATE_REPO_DEFAULT;
   }
 
+  /**
+   * 取远端 main 的 HEAD。
+   * 优先用 `git ls-remote`（git 协议，不受 GitHub API 限流影响——共享代理 IP 下匿名 API 很容易 403）；
+   * 失败再退回 GitHub API。提交信息用 commits/main.atom 补，拿不到就只显示 sha。
+   */
   async function remoteRevision(config) {
     const slug = repoSlug(config);
-    const url = `https://api.github.com/repos/${slug}/commits/main`;
     const proxyMode = parseProxyMode(config?.proxy);
-    const channels = proxyMode.mode === 'direct' ? [''] : proxyMode.mode === 'proxy' ? [proxyMode.url] : ['', await detectProxy().catch(() => '')];
-    let lastError = '';
-    for (const proxy of channels) {
-      if (proxy === '') {
-        if (channels.indexOf(proxy) > 0) continue;
-      }
-      try {
-        const res = await execCurl(url, {
-          proxy,
-          timeoutMs: 15_000,
-          headers: ['Accept: application/vnd.github+json', 'User-Agent: dsh-news-updater'],
-        });
-        if (!res || res.ok !== true) { lastError = `HTTP ${res?.status ?? 0}`; continue; }
-        const parsed = parseRemoteCommit(String(res.body ?? ''));
-        if (parsed) return { ok: true, ...parsed, url: `https://github.com/${slug}` };
-        lastError = '返回内容无法解析';
-      } catch (error) {
-        lastError = messageOf(error);
+    let proxy = '';
+    if (proxyMode.mode === 'proxy') proxy = proxyMode.url;
+    else if (proxyMode.mode !== 'direct') proxy = await detectProxy().catch(() => '');
+    const proxyArgs = proxy ? ['-c', `http.proxy=${proxy}`] : [];
+    const info = { url: `https://github.com/${slug}` };
+
+    const ls = await git([...proxyArgs, 'ls-remote', `https://github.com/${slug}.git`, 'refs/heads/main']);
+    if (ls.ok) {
+      const sha = (ls.out.match(/^([0-9a-f]{40})\s/m) || [])[1];
+      if (sha) {
+        const atom = await remoteCommitMeta(slug, proxy);
+        return { ok: true, sha, short: sha.slice(0, 7), date: atom.date || '', message: atom.message || '', ...info };
       }
     }
-    return { ok: false, error: lastError || '无法访问 GitHub', url: `https://github.com/${slug}` };
+
+    // 退回 GitHub API（可能被限流）
+    try {
+      const res = await execCurl(`https://api.github.com/repos/${slug}/commits/main`, {
+        proxy,
+        timeoutMs: 15_000,
+        headers: ['Accept: application/vnd.github+json', 'User-Agent: dsh-news-updater'],
+      });
+      if (res && res.ok === true) {
+        const parsed = parseRemoteCommit(String(res.body ?? ''));
+        if (parsed) return { ok: true, ...parsed, ...info };
+      }
+    } catch {
+      /* 落到统一错误 */
+    }
+    return { ok: false, error: ls.ok ? '远端没有 main 分支' : (ls.error || '无法访问 GitHub'), ...info };
+  }
+
+  /** 从 commits/main.atom 里读最新一条的标题与时间（不需要 token）。 */
+  async function remoteCommitMeta(slug, proxy) {
+    try {
+      const res = await execCurl(`https://github.com/${slug}/commits/main.atom`, { proxy, timeoutMs: 12_000 });
+      if (!res || res.ok !== true) return {};
+      const body = String(res.body ?? '');
+      const firstEntry = body.split(/<entry>/i)[1] || '';
+      const date = (firstEntry.match(/<updated>([^<]+)<\/updated>/i) || [])[1] || '';
+      const title = (firstEntry.match(/<title>([\s\S]*?)<\/title>/i) || [])[1] || '';
+      return { date: date.trim(), message: oneLine(decodeEntities(title)).slice(0, 120) };
+    } catch {
+      return {};
+    }
   }
 
   async function checkUpdate(force) {

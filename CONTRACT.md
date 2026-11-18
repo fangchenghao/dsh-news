@@ -449,8 +449,14 @@ id，因为 URL 稳定）每天都会被重新推一次，投票自然跟着复�
 
 插件能检查并拉取自己的更新，前提是**安装目录是一个 git 检出**（`gh repo clone` 后 `install_bundle` 指向它）。
 
-**检查**：`GET /api/dsh-news/update` → 比较本地 `git rev-parse HEAD` 与 GitHub `repos/<slug>/commits/main` 的
-sha（短 sha 前缀比较，同提交不算更新），10 分钟内走缓存；`state.update` 只回缓存，不会让 `/state` 变慢。
+**检查**：`GET /api/dsh-news/update` → 比较本地 `git rev-parse HEAD` 与远端 main 的 sha
+（短 sha 前缀比较，同提交不算更新），10 分钟内走缓存；`state.update` 只回缓存，不会让 `/state` 变慢。
+
+取远端 HEAD 的顺序（0.12.1 起）：
+1. `git ls-remote <repo>.git refs/heads/main` —— 走 git 协议，**不受 GitHub API 限流**（共享代理 IP 下匿名
+   REST API 很容易 403，实测过）；
+2. 失败才退回 `api.github.com/repos/<slug>/commits/main`；
+3. 提交信息（时间 + 标题）从 `github.com/<slug>/commits/main.atom` 补，不需要 token，拿不到就只显示 sha。
 
 **应用**：`POST /api/dsh-news/update/apply` → `git pull --ff-only origin main`（自动带上探测到的代理：
 `-c http.proxy=...`）。规则：
