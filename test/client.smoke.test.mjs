@@ -1,0 +1,126 @@
+// 客户端半体的冒烟测试：用极简 React 垫片把三个槽位组件各渲染一遍。
+// 目的不是验证样式，而是抓住「组件里引用了作用域外的变量」这类运行时才会炸的错误
+// （例如 setVotes 被写进 SettingsSection，真机打开设置页就白屏）。
+import test from 'node:test'
+import assert from 'node:assert/strict'
+import fs from 'node:fs'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
+
+const here = path.dirname(fileURLToPath(import.meta.url))
+const clientPath = path.join(here, '..', 'client.js')
+const source = fs.readFileSync(clientPath, 'utf8')
+
+function makeReact() {
+  let hookIndex = 0
+  let states = []
+  const effects = []
+  return {
+    createElement: (type, props, ...children) => ({ type, props: props || {}, children: children.flat(Infinity).filter((c) => c != null && c !== false) }),
+    Fragment: 'Fragment',
+    useState: (initial) => {
+      const i = hookIndex++
+      if (!(i in states)) states[i] = typeof initial === 'function' ? initial() : initial
+      return [states[i], (next) => { states[i] = typeof next === 'function' ? next(states[i]) : next }]
+    },
+    useEffect: (fn) => effects.push(fn),
+    useCallback: (fn) => fn,
+    useMemo: (fn) => fn(),
+    useRef: (value) => ({ current: value }),
+    __begin: () => { hookIndex = 0; effects.length = 0 },
+    __runEffects: () => { for (const fn of effects) { try { fn() } catch { /* 忽略异步副作用 */ } } },
+    __reset: () => { hookIndex = 0; states = []; effects.length = 0 },
+  }
+}
+
+const digest = {
+  date: '2026-11-12',
+  generatedAt: '2026-11-12T00:00:00Z',
+  filterMode: 'llm',
+  totals: { fetched: 80, kept: 2, dropped: 3, summarized: 2 },
+  errors: ['一条运行提示'],
+  items: [
+    { id: 'a', title: '示例新闻', url: 'https://example.com/a', source: 'TC', category: '模型与评测', publishedAt: '2026-11-12T01:00:00Z', summary: '两句总结。', reason: '重要', explore: true },
+    { id: 'b', title: '第二条', url: 'https://example.com/b', source: 'Verge', category: '产品与商业', publishedAt: '2026-11-12T02:00:00Z', summary: '', excerpt: '原文摘录一句。', reason: '一般' },
+  ],
+  dropped: [{ title: '被滤掉的', source: 'HN', reason: '重复' }],
+  sources: [{ sourceId: 'tc', name: 'TC', ok: true, count: 3, error: '', via: 'direct' }],
+  markdown: '# md',
+}
+const state = {
+  ok: true, running: false, digestDir: '/tmp', proxyDetected: '', version: '0.5.1',
+  candidateSelection: { mode: 'reserve-then-fill', reservePerSource: 2 },
+  taste: { votes: { a: 'up' }, voteCount: 1, profile: { text: '## 值得看\n- 芯片', updatedAt: 1, basedOn: 1 } },
+  config: {
+    enabled: true, interests: 'AI 产业', dailyTime: '08:00', maxCandidates: 80, maxItems: 25,
+    exploreRatio: 0.2, proxy: '', rsshubBase: '', announceToAgent: false, model: {},
+    sources: [{ id: 'tc', name: 'TC', type: 'rss', url: 'https://example.com/rss', category: '媒体', enabled: true, maxItems: 2 }],
+  },
+  digest,
+}
+
+function loadModule() {
+  const React = makeReact()
+  const store = {}
+  globalThis.window = { __ModuleLoader__: { load: (entry) => { globalThis.__entry = entry } } }
+  Object.defineProperty(globalThis, 'navigator', { value: { clipboard: { writeText: async () => {} } }, configurable: true })
+  const fakeFetch = async (url) => {
+    const body = String(url).includes('/state') || String(url).includes('/digest') ? state : { ok: true }
+    return {
+      ok: true,
+      status: 200,
+      json: async () => body,
+      text: async () => JSON.stringify(body),
+    }
+  }
+  const requireShim = (name) => (name === 'react' ? React : {})
+  new Function('window', 'require', 'fetch', 'navigator', source)(globalThis.window, requireShim, fakeFetch, globalThis.navigator)
+  const entry = globalThis.__entry
+  const mod = entry.factory ? entry.factory(requireShim) : entry
+  mod.apply({
+    slots: {
+      inject: (name, fn) => fn(),
+      register: (reg, comp) => { store[reg.name] = { reg, comp }; return () => {} },
+    },
+  })
+  return { React, store }
+}
+
+test('客户端：三个槽位都能注册', () => {
+  const { store } = loadModule()
+  assert.deepEqual(Object.keys(store).sort(), ['main', 'settings.section', 'sidebar.panellist'])
+})
+
+test('客户端：每个组件都能渲染，不引用作用域外变量', async () => {
+  const { React, store } = loadModule()
+  for (const [name, entry] of Object.entries(store)) {
+    React.__reset()
+    let tree
+    assert.doesNotThrow(() => {
+      React.__begin()
+      tree = entry.comp({ size: 18, active: false })
+    }, `${name} 首次渲染炸了`)
+    // 让 useEffect 跑起来（会触发 setState），再渲染一次，覆盖「数据到达后」的渲染路径
+    React.__runEffects()
+    await new Promise((resolve) => setTimeout(resolve, 30))
+    assert.doesNotThrow(() => {
+      React.__begin()
+      tree = entry.comp({ size: 18, active: false })
+    }, `${name} 二次渲染炸了`)
+  }
+})
+
+test('客户端：设置页渲染出品味档案与重新学习入口', async () => {
+  const { React, store } = loadModule()
+  const comp = store['settings.section'].comp
+  React.__reset()
+  React.__begin()
+  comp({})
+  React.__runEffects()
+  await new Promise((resolve) => setTimeout(resolve, 30))
+  React.__begin()
+  const tree = comp({})
+  const text = JSON.stringify(tree, (k, v) => (typeof v === 'function' ? '[fn]' : v))
+  assert.match(text, /品味档案/)
+  assert.match(text, /立即重新学习/)
+})

@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Daily AI Brief",
+    "description": "Pulls your AI sources every morning, lets the model decide what is worth keeping, and writes a short summary for each item."
+  }
+}

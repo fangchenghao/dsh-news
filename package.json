@@ -1,0 +1,49 @@
+{
+  "name": "@local/dsh-news",
+  "version": "0.11.0",
+  "private": true,
+  "type": "module",
+  "description": "每天聚合 AI 信息源，由模型判断留弃并逐条总结；带阅读界面、反馈学习与探索位。DeepSeek Harness 插件。",
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "CONTRACT.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": []
+    }
+  },
+  "license": "MIT",
+  "author": {
+    "name": "fangchenghao"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/fangchenghao/dsh-news.git"
+  },
+  "homepage": "https://github.com/fangchenghao/dsh-news",
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "plugin",
+    "rss",
+    "ai-news",
+    "digest"
+  ]
+}

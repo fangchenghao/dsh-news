@@ -1,0 +1,6 @@
+.DS_Store
+node_modules/
+.dsh-computer-use/
+.preview/
+*.bak
+*.log

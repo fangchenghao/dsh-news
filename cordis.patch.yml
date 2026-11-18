@@ -1,0 +1,5 @@
+# dsh-news：每日 AI 简报。宿主持有抓取 / 模型筛选 / 逐条总结 / 定时，
+# 浏览器半体在 设置 →「每日简报」 里渲染当天结果与配置。
+- insert:
+    - id: dsh-news-digest
+      name: '@local/dsh-news'
