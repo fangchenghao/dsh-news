@@ -78,6 +78,17 @@ window.__ModuleLoader__.load({
       tasteResetConfirm: '确定复原？',
       tasteResetHint: '清空全部反馈和学到的品味，回到从没学过的状态。会在数据目录留一份备份。',
       tasteResetDone: '已复原：反馈和品味档案都清空了',
+      updateTitle: '版本与更新',
+      updateCheck: '检查更新',
+      updateChecking: '检查中…',
+      updateApply: '立即更新',
+      updateApplying: '更新中…',
+      updateLatest: '已是最新',
+      updateBehind: '有新版本',
+      updateRestart: '更新完成，重启 Harness 后生效',
+      updateCurrent: '当前',
+      updateRemote: '最新',
+      updateNotGit: '当前安装不是 git 检出，无法自动更新（重新克隆仓库后再装一次即可）',
       newSource: '新源',
       remove: '删除',
       test: '测试',
@@ -497,6 +508,7 @@ a.rssnews_set_itemTitle:hover{text-decoration:underline;text-underline-offset:3p
 .rssnews_set_check{display:flex;align-items:center;gap:6px;font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary)}
 .rssnews_set_footer{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding-top:4px}
 .rssnews_set_btn.is-danger{color:var(--dsw-alias-state-danger-primary);border-color:var(--dsw-alias-state-danger-primary)}
+.rssnews_set_badge{font-size:11px;line-height:16px;padding:1px 6px;border-radius:4px;color:var(--dsw-alias-state-business-primary);border:.5px solid var(--dsw-alias-state-business-primary)}
 .rssnews_set_profile{white-space:pre-wrap;font-size:12px;line-height:20px;color:var(--dsw-alias-label-secondary);background:var(--dsw-alias-bg-layer-1);border:.5px solid var(--dsw-alias-border-l1);border-radius:8px;padding:10px 12px;max-height:260px;overflow:auto}
 .rssnews_set_mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;line-height:16px;color:var(--dsw-alias-label-tertiary);word-break:break-all}
 .rssnews_set_group{display:flex;flex-direction:column;gap:12px;padding-top:6px}
@@ -626,6 +638,8 @@ a.rssnews_set_itemTitle:hover{text-decoration:underline;text-underline-offset:3p
   body: JSON.stringify({ id, vote }),
 })
 const learnTaste = () => callApi('/api/dsh-news/learn', { method: 'POST' })
+const checkUpdateApi = () => callApi('/api/dsh-news/update')
+const applyUpdateApi = () => callApi('/api/dsh-news/update/apply', { method: 'POST' })
 const testSource = (source) => callApi('/api/dsh-news/source/test', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -1644,6 +1658,10 @@ function SourceRow(props) {
       const [testResults, setTestResults] = useState({})
       const [testingId, setTestingId] = useState('')
       const [learning, setLearning] = useState(false)
+      const [updateInfo, setUpdateInfo] = useState(null)
+      const [checking, setChecking] = useState(false)
+      const [applying, setApplying] = useState(false)
+      const [updateMsg, setUpdateMsg] = useState('')
       const [resetting, setResetting] = useState(false)
       const [confirmReset, setConfirmReset] = useState(false)
       const resetTimer = useRef(null)
@@ -1678,6 +1696,42 @@ function SourceRow(props) {
         const timer = setTimeout(() => { if (alive.current) setNotice('') }, 2400)
         return () => clearTimeout(timer)
       }, [notice])
+
+      const onCheckUpdate = useCallback(async () => {
+        if (checking) return
+        setChecking(true)
+        setUpdateMsg('')
+        try {
+          const info = await checkUpdateApi()
+          if (!alive.current) return
+          setUpdateInfo(info)
+          if (info && info.gitAvailable === false) setUpdateMsg(T.updateNotGit)
+        } catch (e) {
+          if (alive.current) setUpdateMsg((e && e.message) || String(e))
+        } finally {
+          if (alive.current) setChecking(false)
+        }
+      }, [checking])
+
+      const onApplyUpdate = useCallback(async () => {
+        if (applying) return
+        setApplying(true)
+        setUpdateMsg('')
+        try {
+          const res = await applyUpdateApi()
+          if (!alive.current) return
+          if (res && res.ok) {
+            setUpdateMsg(res.changed ? T.updateRestart : T.updateLatest)
+            await onCheckUpdate()
+          } else {
+            setUpdateMsg((res && res.error) || '更新失败')
+          }
+        } catch (e) {
+          if (alive.current) setUpdateMsg((e && e.message) || String(e))
+        } finally {
+          if (alive.current) setApplying(false)
+        }
+      }, [applying, onCheckUpdate])
 
       const onReset = useCallback(async () => {
         if (resetting) return
@@ -1875,6 +1929,32 @@ function SourceRow(props) {
               title: T.tasteResetHint,
             }, resetting ? T.tasteLearning : (confirmReset ? T.tasteResetConfirm : T.tasteReset))),
           h('div', { className: 'rssnews_set_hint' }, T.tasteResetHint),
+        ),
+
+        h('div', { className: 'rssnews_set_group' },
+          h('div', { className: 'rssnews_set_groupTitle' }, T.updateTitle),
+          h('div', { className: 'rssnews_set_bar' },
+            h('span', { className: 'rssnews_set_label' },
+              T.updateCurrent + '：' + ((updateInfo && updateInfo.local && updateInfo.local.short) || '—')),
+            updateInfo && updateInfo.remote && updateInfo.remote.short
+              ? h('span', { className: 'rssnews_set_hint' }, T.updateRemote + '：' + updateInfo.remote.short)
+              : null,
+            updateInfo && updateInfo.behind
+              ? h('span', { className: 'rssnews_set_badge' }, T.updateBehind)
+              : (updateInfo && updateInfo.ok ? h('span', { className: 'rssnews_set_hint' }, T.updateLatest) : null),
+            h('span', { className: 'rssnews_set_grow' }),
+            h('button', { className: 'rssnews_set_btn', onClick: onCheckUpdate, disabled: checking },
+              checking ? T.updateChecking : T.updateCheck),
+            h('button', {
+              className: 'rssnews_set_btn',
+              onClick: onApplyUpdate,
+              disabled: applying || !(updateInfo && updateInfo.behind),
+            }, applying ? T.updateApplying : T.updateApply)),
+          updateMsg ? h('div', { className: 'rssnews_set_hint' }, updateMsg) : null,
+          updateInfo && updateInfo.remote && updateInfo.remote.message
+            ? h('div', { className: 'rssnews_set_hint' }, updateInfo.remote.short + ' · ' + updateInfo.remote.message)
+            : null,
+          h('div', { className: 'rssnews_set_hint' }, '更新走 git fast-forward，拉完需要重启 Harness 才生效。'),
         ),
 
         h('div', { className: 'rssnews_set_group' },

@@ -617,6 +617,19 @@ test('selectCandidates: 候选不足上限时，单源 maxItems 仍然生效', (
   assert.equal(out.items.length, 2, '不足 maxCandidates 时也必须按单源上限裁剪');
 });
 
+test('parseRemoteCommit + hasUpdate: 判断远端是否更新', () => {
+  const remote = news.parseRemoteCommit(JSON.stringify({
+    sha: 'abcdef1234567890',
+    commit: { message: 'feat: newer', committer: { date: '2026-11-18T00:00:00Z' } },
+  }));
+  assert.equal(remote.short, 'abcdef1');
+  assert.equal(remote.message, 'feat: newer');
+  assert.equal(news.hasUpdate('abcdef1234567890', 'abcdef1234567890'), false, '同一提交不算更新');
+  assert.equal(news.hasUpdate('abcdef1', 'abcdef1234567890'), false, '短 sha 是前缀也不算');
+  assert.equal(news.hasUpdate('1111111', 'abcdef1234567890'), true);
+  assert.equal(news.parseRemoteCommit('不是 json'), null);
+});
+
 test('filterFreshness: 丢掉过旧条目，保留无日期的', () => {
   const now = Date.UTC(2026, 10, 18, 0, 0, 0);
   const items = [
@@ -1635,7 +1648,7 @@ test('tick: config.enabled=false 不生成', async (t) => {
 // HTTP 路由
 // ---------------------------------------------------------------------------
 
-test('路由：注册 8 条 exact 路由，method/path 正确', async (t) => {
+test('路由：注册 10 条 exact 路由，method/path 正确', async (t) => {
   const { runtime } = await makeRuntime(t, { services: { llm: makeLlm() }, execCurl: defaultCurl(), config: smallConfig() });
   const ctx = makeFakeCtx({ llm: makeLlm() });
   news.registerRoutes(ctx, runtime);
@@ -1650,6 +1663,8 @@ test('路由：注册 8 条 exact 路由，method/path 正确', async (t) => {
       'exact /api/dsh-news/feedback',
       'exact /api/dsh-news/learn',
       'exact /api/dsh-news/taste/reset',
+      'exact /api/dsh-news/update',
+      'exact /api/dsh-news/update/apply',
     ],
   );
 });
@@ -1803,7 +1818,7 @@ test('路由：GET digest 支持 date 参数、缺省今天、坏日期 400', as
 // 宿主注册（apply / prompt / scheduler）
 // ---------------------------------------------------------------------------
 
-test('apply: 注册 8 条路由 + systemPrompt 段（interpolate:false）+ 定时器，dispose 后清理', async (t) => {
+test('apply: 注册 10 条路由 + systemPrompt 段（interpolate:false）+ 定时器，dispose 后清理', async (t) => {
   const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'dsh-news-apply-'));
   const previous = process.env.DSH_NEWS_HOME;
   process.env.DSH_NEWS_HOME = root;
@@ -1817,7 +1832,7 @@ test('apply: 注册 8 条路由 + systemPrompt 段（interpolate:false）+ 定�
   news.apply(ctx, {});
   await new Promise((resolve) => setTimeout(resolve, 80));
 
-  assert.equal(ctx.routes.length, 8);
+  assert.equal(ctx.routes.length, 10);
   assert.equal(ctx.prompts.length, 1);
   const section = ctx.prompts[0];
   assert.equal(section.name, 'plugin:dsh-news-digest');

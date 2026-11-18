@@ -444,3 +444,21 @@ id，因为 URL 稳定）每天都会被重新推一次，投票自然跟着复�
 
 用 11-18 的真实数据验证：25 条里有 3 条超龄（其中 1 条是 2025 年的），再叠加 7 天重复过滤又跳过 1 条，
 最终 21 条。设置页两项都可调，设 0 即恢复旧行为。
+
+## 21. 自更新（0.12.0）
+
+插件能检查并拉取自己的更新，前提是**安装目录是一个 git 检出**（`gh repo clone` 后 `install_bundle` 指向它）。
+
+**检查**：`GET /api/dsh-news/update` → 比较本地 `git rev-parse HEAD` 与 GitHub `repos/<slug>/commits/main` 的
+sha（短 sha 前缀比较，同提交不算更新），10 分钟内走缓存；`state.update` 只回缓存，不会让 `/state` 变慢。
+
+**应用**：`POST /api/dsh-news/update/apply` → `git pull --ff-only origin main`（自动带上探测到的代理：
+`-c http.proxy=...`）。规则：
+
+- 工作区有未提交改动 → 直接拒绝（`git status --porcelain` 非空）；
+- 只做 fast-forward，不合并、不重置；
+- 拉完返回 `{changed, from, to, needsRestart: true}` —— **加载中的模块不会被替换，必须重启 Harness**。
+
+配置：`updateRepo`（默认 `fangchenghao/dsh-news`）。设置页「版本与更新」显示当前/最新短 sha、落后时出现「有新版本」徽标与「立即更新」按钮。
+
+注意：如果安装目录不是 git 检出（比如直接拷贝过去），检查会返回 `gitAvailable: false`，界面提示改用克隆后重装。

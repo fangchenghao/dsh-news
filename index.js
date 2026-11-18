@@ -37,6 +37,7 @@ import { promises as fsp } from 'node:fs';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 // ---------------------------------------------------------------------------
 // 常量
@@ -44,7 +45,7 @@ import path from 'node:path';
 
 export const PACKAGE_ID = '@local/dsh-news';
 /** 代码版本：`/api/dsh-news/state` 会回传，用来判断宿主是否已加载新版。 */
-export const CODE_VERSION = '0.11.0';
+export const CODE_VERSION = '0.12.0';
 export const SECTION_NAME = 'plugin:dsh-news-digest';
 export const SECTION_ORDER = 160;
 
@@ -57,6 +58,8 @@ export const ROUTE_PATHS = {
   feedback: '/api/dsh-news/feedback',
   learn: '/api/dsh-news/learn',
   tasteReset: '/api/dsh-news/taste/reset',
+  update: '/api/dsh-news/update',
+  updateApply: '/api/dsh-news/update/apply',
 };
 
 export const SOURCE_TYPES = [
@@ -111,6 +114,11 @@ const PROXY_CACHE_MS = 60_000;
 const MAX_SOURCES = 40;
 const TICK_INTERVAL_MS = 30_000;
 const MOUNT_CATCH_UP_MS = 6_000;
+/** 自更新：默认仓库、检查间隔、git 操作超时。 */
+const UPDATE_REPO_DEFAULT = 'fangchenghao/dsh-news';
+const UPDATE_CHECK_TTL_MS = 10 * 60 * 1000;
+const GIT_TIMEOUT_MS = 60_000;
+
 /** 定时生成失败后的重试冷却，避免一整天每 30 秒撞一次失败。 */
 const TICK_RETRY_COOLDOWN_MS = 10 * 60 * 1000;
 const DESKTOP_UA =
@@ -912,6 +920,7 @@ export function defaultExecCurl(url, options = {}) {
     'Accept: application/rss+xml, application/atom+xml, application/xml;q=0.9, text/xml;q=0.9, text/html;q=0.8, */*;q=0.7',
     '-H',
     'Accept-Language: zh-CN,zh;q=0.9,en;q=0.8',
+    ...(Array.isArray(options.headers) ? options.headers.flatMap((h) => ['-H', String(h)]) : []),
     '-w',
     `${CURL_STATUS_MARK}%{http_code}`,
   ];
@@ -2561,6 +2570,31 @@ function isAllowedRequest(request) {
 /**
  * 创建插件运行时。测试可以注入 root / execCurl / probeProxy / now，从而完全离线。
  */
+/** 解析 GitHub commits API 的返回，抽出 sha / 时间 / 提交信息。 */
+export function parseRemoteCommit(json) {
+  const obj = typeof json === 'string' ? (() => { try { return JSON.parse(json); } catch { return null; } })() : json;
+  if (!isPlainObject(obj)) return null;
+  const sha = typeof obj.sha === 'string' ? obj.sha : '';
+  if (!/^[0-9a-f]{7,40}$/i.test(sha)) return null;
+  return {
+    sha,
+    short: sha.slice(0, 7),
+    date: String(obj.commit?.committer?.date ?? obj.commit?.author?.date ?? ''),
+    message: oneLine(String(obj.commit?.message ?? '')).slice(0, 120),
+  };
+}
+
+/** 本地与远端是否不同（不同即「有更新」）。 */
+export function hasUpdate(localSha, remoteSha) {
+  if (!localSha || !remoteSha) return false;
+  const a = String(localSha).toLowerCase();
+  const b = String(remoteSha).toLowerCase();
+  if (a === b) return false;
+  // 允许短 sha 前缀比较
+  if (a.startsWith(b) || b.startsWith(a)) return false;
+  return true;
+}
+
 export function createRuntime(options = {}) {
   const ctx = options.ctx ?? {};
   const root = path.resolve(
@@ -2837,6 +2871,107 @@ export function createRuntime(options = {}) {
       );
       return parsed;
     }
+  }
+
+  // -------------------------------------------------------------------------
+  // 自更新：比较本地 git HEAD 与 GitHub 上 main 的 HEAD
+  // -------------------------------------------------------------------------
+  const packageDir = path.dirname(fileURLToPath(import.meta.url));
+  let updateCache = { at: 0, value: null };
+
+  function git(args, cwd = packageDir) {
+    return new Promise((resolve) => {
+      execFile('git', args, { cwd, timeout: GIT_TIMEOUT_MS, encoding: 'utf8' }, (error, stdout, stderr) => {
+        if (error) {
+          resolve({ ok: false, error: oneLine(String(stderr || error.message || '')).slice(0, 300) });
+          return;
+        }
+        resolve({ ok: true, out: String(stdout || '').trim() });
+      });
+    });
+  }
+
+  async function localRevision() {
+    const head = await git(['rev-parse', 'HEAD']);
+    if (!head.ok) return { ok: false, error: head.error, tracking: false };
+    const status = await git(['status', '--porcelain']);
+    const dirty = status.ok ? status.out.length > 0 : false;
+    return { ok: true, sha: head.out, short: head.out.slice(0, 7), dirty, tracking: true };
+  }
+
+  function repoSlug(config) {
+    const raw = String(config?.updateRepo ?? '').trim();
+    return /^[\w.-]+\/[\w.-]+$/.test(raw) ? raw : UPDATE_REPO_DEFAULT;
+  }
+
+  async function remoteRevision(config) {
+    const slug = repoSlug(config);
+    const url = `https://api.github.com/repos/${slug}/commits/main`;
+    const proxyMode = parseProxyMode(config?.proxy);
+    const channels = proxyMode.mode === 'direct' ? [''] : proxyMode.mode === 'proxy' ? [proxyMode.url] : ['', await detectProxy().catch(() => '')];
+    let lastError = '';
+    for (const proxy of channels) {
+      if (proxy === '') {
+        if (channels.indexOf(proxy) > 0) continue;
+      }
+      try {
+        const res = await execCurl(url, {
+          proxy,
+          timeoutMs: 15_000,
+          headers: ['Accept: application/vnd.github+json', 'User-Agent: dsh-news-updater'],
+        });
+        if (!res || res.ok !== true) { lastError = `HTTP ${res?.status ?? 0}`; continue; }
+        const parsed = parseRemoteCommit(String(res.body ?? ''));
+        if (parsed) return { ok: true, ...parsed, url: `https://github.com/${slug}` };
+        lastError = '返回内容无法解析';
+      } catch (error) {
+        lastError = messageOf(error);
+      }
+    }
+    return { ok: false, error: lastError || '无法访问 GitHub', url: `https://github.com/${slug}` };
+  }
+
+  async function checkUpdate(force) {
+    const now = clock().getTime();
+    if (!force && updateCache.value && now - updateCache.at < UPDATE_CHECK_TTL_MS) return updateCache.value;
+    const config = await loadConfig();
+    const local = await localRevision();
+    const remote = await remoteRevision(config);
+    const value = {
+      ok: true,
+      checkedAt: now,
+      local: local.ok ? { sha: local.sha, short: local.short, dirty: local.dirty } : { error: local.error },
+      remote: remote.ok ? { sha: remote.sha, short: remote.short, date: remote.date, message: remote.message } : { error: remote.error },
+      behind: local.ok && remote.ok ? hasUpdate(local.sha, remote.sha) : false,
+      gitAvailable: local.ok,
+      repoUrl: remote.url,
+    };
+    updateCache = { at: now, value };
+    return value;
+  }
+
+  /** 拉取更新：只做 fast-forward，脏工作区直接拒绝。装的是本地链接包，拉完需要重启宿主生效。 */
+  async function applyUpdate() {
+    const config = await loadConfig();
+    const local = await localRevision();
+    if (!local.ok) return { ok: false, error: `这个安装不是 git 检出，无法自动更新：${local.error}` };
+    if (local.dirty) return { ok: false, error: '插件目录有未提交的本地改动，先处理干净再更新' };
+    const proxyMode = parseProxyMode(config?.proxy);
+    const proxy = proxyMode.mode === 'proxy' ? proxyMode.url : proxyMode.mode === 'direct' ? '' : await detectProxy().catch(() => '');
+    const args = ['-c', 'user.name=dsh-news-updater', '-c', 'user.email=updater@users.noreply.github.com'];
+    if (proxy) args.push('-c', `http.proxy=${proxy}`);
+    const pulled = await git([...args, 'pull', '--ff-only', 'origin', 'main']);
+    if (!pulled.ok) return { ok: false, error: `git pull 失败：${pulled.error}` };
+    const after = await localRevision();
+    updateCache = { at: 0, value: null };
+    return {
+      ok: true,
+      from: local.short,
+      to: after.ok ? after.short : '',
+      changed: after.ok ? after.sha !== local.sha : false,
+      output: pulled.out.slice(0, 800),
+      needsRestart: true,
+    };
   }
 
   async function readFeedbackStored() {
@@ -3426,6 +3561,8 @@ export function createRuntime(options = {}) {
         proxyDetected: await detectProxy(),
         // 现场探针：看到 candidateSelection 说明宿主已加载「按源保底」这版代码
         version: CODE_VERSION,
+        // 只回缓存，state 不应该因为检查更新而变慢
+        update: updateCache.value,
         taste: await (async () => {
           const fb = await readFeedbackStored();
           return {
@@ -3503,6 +3640,15 @@ export function createRuntime(options = {}) {
     });
   }
 
+  async function handleUpdateCheck() {
+    return { body: await checkUpdate(true) };
+  }
+
+  async function handleUpdateApply() {
+    const result = await applyUpdate();
+    return { body: result };
+  }
+
   async function handleTasteReset() {
     return { body: await resetTaste() };
   }
@@ -3558,6 +3704,9 @@ export function createRuntime(options = {}) {
     handleLearn,
     handleTasteReset,
     resetTaste,
+    handleUpdateCheck,
+    handleUpdateApply,
+    checkUpdate,
     isRunning: () => running,
     lastError: () => lastError,
     promptText: () => promptCache,
@@ -3577,6 +3726,8 @@ const ROUTE_DEFS = [
   { method: 'POST', path: ROUTE_PATHS.feedback, run: (runtime, request) => runtime.handleFeedback(request) },
   { method: 'POST', path: ROUTE_PATHS.learn, run: (runtime) => runtime.handleLearn() },
   { method: 'POST', path: ROUTE_PATHS.tasteReset, run: (runtime) => runtime.handleTasteReset() },
+  { method: 'GET', path: ROUTE_PATHS.update, run: (runtime) => runtime.handleUpdateCheck() },
+  { method: 'POST', path: ROUTE_PATHS.updateApply, run: (runtime) => runtime.handleUpdateApply() },
 ];
 
 function makeHandler(runtime, def, log) {
