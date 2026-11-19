@@ -45,7 +45,7 @@ import { fileURLToPath } from 'node:url';
 
 export const PACKAGE_ID = '@local/dsh-news';
 /** 代码版本：`/api/dsh-news/state` 会回传，用来判断宿主是否已加载新版。 */
-export const CODE_VERSION = '0.12.1';
+export const CODE_VERSION = '0.13.0';
 export const SECTION_NAME = 'plugin:dsh-news-digest';
 export const SECTION_ORDER = 160;
 
@@ -124,6 +124,7 @@ const TICK_RETRY_COOLDOWN_MS = 10 * 60 * 1000;
 const DESKTOP_UA =
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 const CURL_STATUS_MARK = '\n@@dsh-news:http-status:';
+const CURL_REDIRECT_MARK = '\n@@dsh-news:redirect-url:';
 
 export const DEFAULT_INTERESTS =
   '我在跟踪 AI 领域的进展，重点关注：① 大模型能力与评测（新模型发布、benchmark、推理/上下文/多模态能力的实质提升）；② Agent 与工程实践（编码 agent、工具调用、RAG、上下文工程、生产落地经验）；③ 开源模型与生态（权重开放、微调、推理框架、本地部署）；④ AI 产品与商业（重要产品发布、定价、融资并购、平台政策变化）；⑤ 安全、对齐与监管（模型安全事件、政策法规、行业争议）。不要保留：纯营销软文、没有实质信息的产品促销、与 AI 无关的泛科技八卦、单纯股价波动、以及同一事件里信息量更低的重复报道。';
@@ -786,6 +787,22 @@ export function redactSecrets(text) {
     .replace(/([?&](?:token|key|apikey|api_key|access_token|sig|signature)=)[^&\s]+/gi, '$1***');
 }
 
+/** 正文抓取最多跟随几跳重定向。 */
+const MAX_ARTICLE_REDIRECTS = 5;
+
+/** 把 Location 解析成绝对地址；非 http(s) 一律丢弃。 */
+export function resolveRedirect(location, base) {
+  const raw = String(location ?? '').trim();
+  if (!raw) return '';
+  try {
+    const resolved = new URL(raw, base);
+    if (resolved.protocol !== 'http:' && resolved.protocol !== 'https:') return '';
+    return resolved.href;
+  } catch {
+    return '';
+  }
+}
+
 /** 判断 URL 是否指向内网/链路本地地址（用于挡住 feed 注入的内网探测）。 */
 export function isPrivateUrl(input) {
   let host = '';
@@ -922,7 +939,7 @@ export function defaultExecCurl(url, options = {}) {
     'Accept-Language: zh-CN,zh;q=0.9,en;q=0.8',
     ...(Array.isArray(options.headers) ? options.headers.flatMap((h) => ['-H', String(h)]) : []),
     '-w',
-    `${CURL_STATUS_MARK}%{http_code}`,
+    `${CURL_STATUS_MARK}%{http_code}${options.captureRedirect ? `${CURL_REDIRECT_MARK}%{redirect_url}` : ''}`,
   ];
   if (options.noRedirect) {
     // 正文抓取是面向不可信 feed 的：不跟随重定向，避免 302 到内网
@@ -959,22 +976,35 @@ export function defaultExecCurl(url, options = {}) {
         const raw = typeof stdout === 'string' ? stdout : Buffer.from(stdout ?? '').toString('utf8');
         let body = raw;
         let status = 0;
+        let redirect = '';
         const markIndex = raw.lastIndexOf(CURL_STATUS_MARK);
         if (markIndex >= 0) {
-          status = Number.parseInt(raw.slice(markIndex + CURL_STATUS_MARK.length).trim(), 10);
+          const tail = raw.slice(markIndex + CURL_STATUS_MARK.length);
+          const redirectIndex = tail.indexOf(CURL_REDIRECT_MARK);
+          if (redirectIndex >= 0) {
+            status = Number.parseInt(tail.slice(0, redirectIndex).trim(), 10);
+            redirect = tail.slice(redirectIndex + CURL_REDIRECT_MARK.length).trim();
+          } else {
+            status = Number.parseInt(tail.trim(), 10);
+          }
           body = raw.slice(0, markIndex);
         }
         body = body.replace(/^\uFEFF/, '');
         if (!Number.isFinite(status) || status < 100) status = 0;
+        if (status >= 300 && status < 400) {
+          // 不在这里判死：正文抓取需要知道跳去哪，并逐跳做内网校验
+          resolve({ ok: false, status, body, redirect, error: httpErrorText(status) });
+          return;
+        }
         if (status < 200 || status >= 300) {
-          resolve({ ok: false, status, body, error: httpErrorText(status) });
+          resolve({ ok: false, status, body, redirect: '', error: httpErrorText(status) });
           return;
         }
         if (!body.trim()) {
           resolve({ ok: false, status, body: '', error: '响应为空（可能被反爬、需要登录，或源已失效）' });
           return;
         }
-        resolve({ ok: true, status, body, error: '' });
+        resolve({ ok: true, status, body, redirect: '', error: '' });
       },
     );
   });
@@ -3097,42 +3127,71 @@ export function createRuntime(options = {}) {
   }
 
   /** 抓一次原文正文；直连不通再走探测到的代理。失败返回 ''（不抛错）。 */
+  /**
+   * 抓一篇正文。
+   * 不能简单地禁用重定向：绝大多数站点会给 301/302（http→https、补斜杠、canonical、地区跳转），
+   * 早先的 `--max-redirs 0` 让这些页面全部变成「没有正文」。
+   * 现在手动逐跳跟随，并对**每一跳**重新做协议与内网校验（这才是挡 SSRF 的正确位置）。
+   */
   async function readArticleBody(url, config) {
     if (!isHttpUrl(url)) return '';
-    // feed 里的链接是外部数据：不允许它把宿主当成内网探针（SSRF）
     if (isPrivateUrl(url) || isLoopbackUrl(url)) return '';
+
     const proxyMode = parseProxyMode(config?.proxy);
     const channels = [];
     if (proxyMode.mode === 'direct') channels.push('');
     else if (proxyMode.mode === 'proxy') channels.push(proxyMode.url);
     else {
       channels.push('');
-      const detected = await detectProxy();
+      const detected = await detectProxy().catch(() => '');
       if (detected) channels.push(detected);
     }
+
     for (const proxy of channels) {
-      try {
-        const response = await execCurl(url, { proxy, timeoutMs: ARTICLE_TIMEOUT_MS, noRedirect: true });
+      let target = url;
+      for (let hop = 0; hop < MAX_ARTICLE_REDIRECTS; hop += 1) {
+        let response;
+        try {
+          response = await execCurl(target, {
+            proxy,
+            timeoutMs: ARTICLE_TIMEOUT_MS,
+            noRedirect: true,
+            captureRedirect: true,
+          });
+        } catch {
+          break;
+        }
+
+        if (response && response.status >= 300 && response.status < 400) {
+          const next = resolveRedirect(response.redirect, target);
+          if (!next) break;
+          if (isPrivateUrl(next) || isLoopbackUrl(next)) {
+            // 跳到内网：直接放弃这篇，不跟随
+            break;
+          }
+          target = next;
+          continue;
+        }
+
         if (response && response.ok === true) {
           const text = extractArticleText(String(response.body ?? ''));
           if (text.length >= 120) return text;
         }
-      } catch {
-        /* 换下一个通道 */
+        break;
       }
     }
     return '';
+  }
+
+  let exploreHints = { keptSources: [], keptCategories: [] };
+  function configureExplorationHints(hints) {
+    exploreHints = { ...exploreHints, ...hints };
   }
 
   /**
    * 探索位：领域闸门（AI/科技/科学）先筛一遍，再让模型从里面挑主题分散的几条。
    * 模型不可用或输出不合法时，退回 pickExploration 的启发式排序。
    */
-  let exploreHints = { keptSources: [], keptCategories: [] };
-  function configureExplorationHints(hints) {
-    exploreHints = { ...exploreHints, ...hints };
-  }
-
   async function pickExplorationItems(pool, count, config, route, errors) {
     const gated = (Array.isArray(pool) ? pool : []).filter((item) => isExplorationDomain(item));
     if (gated.length === 0 || count <= 0) return [];
@@ -3178,6 +3237,7 @@ export function createRuntime(options = {}) {
     let cacheDirty = false;
     let summarized = 0;
     let skipped = 0;
+    let noBody = 0;
 
     await mapPool(items, SUMMARY_CONCURRENCY, async (item) => {
       const key = summaryCacheKey(item.id);
@@ -3201,6 +3261,7 @@ export function createRuntime(options = {}) {
             body = '';
           }
         }
+        if (!body) noBody += 1;
         const { system, prompt } = buildSummaryPrompt(Object.assign({}, item, { body }));
         const askOnce = async (tokens) => callModel({
           route,
@@ -3246,6 +3307,9 @@ export function createRuntime(options = {}) {
     });
 
     if (skipped > 0) errors.push(`整体生成超过时间预算，${skipped} 条保留项未生成摘要`);
+    if (noBody > 0) {
+      errors.push(`${noBody} 条没有抓到正文（只按标题与源摘要生成），这些摘要细节会偏少`);
+    }
     if (cacheDirty) {
       try {
         await writeJsonAtomic(cacheFile, pruneSummaryCache(cache, clock().getTime()));

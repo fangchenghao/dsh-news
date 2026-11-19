@@ -468,3 +468,20 @@ id，因为 URL 稳定）每天都会被重新推一次，投票自然跟着复�
 配置：`updateRepo`（默认 `fangchenghao/dsh-news`）。设置页「版本与更新」显示当前/最新短 sha、落后时出现「有新版本」徽标与「立即更新」按钮。
 
 注意：如果安装目录不是 git 检出（比如直接拷贝过去），检查会返回 `gitAvailable: false`，界面提示改用克隆后重装。
+
+## 22. 正文抓取：手动逐跳跟随重定向（0.13.0）
+
+**这是一次回归**：0.9.0 为了挡 SSRF 给正文抓取加了 `--max-redirs 0`，结果凡是会跳转的站点
+（`deepmind.google` → `blog.google`、http→https、补斜杠、地区跳转）全变成「302 + 0 字节」，
+被当成「没有正文」，摘要只能按标题写。用户实测 DeepMind 的文章明明有正文和配图。
+
+修法（在**正确的层级**挡 SSRF）：
+
+1. curl 层新增 `captureRedirect`：不跟随跳转，但通过 `-w %{redirect_url}` 把目标带回来；
+2. `readArticleBody` 手动逐跳跟随（最多 `MAX_ARTICLE_REDIRECTS = 5`），**每一跳**都用
+   `resolveRedirect()` 解析绝对地址、校验协议（只允许 http/https）、再用 `isPrivateUrl()/isLoopbackUrl()`
+   拦内网——跳到内网立即放弃整篇；
+3. 抓不到正文的条数写进 `errors`：「N 条没有抓到正文（只按标题与源摘要生成）」。
+
+实测（2026-11-19 的 25 条）：修复前 DeepMind / 爱范儿等大批条目正文为空；修复后 **22/25 条抓到正文**
+（2599–2600 字），只有 3 条抓不到——2 条是 Google News 的聚合跳转链接，1 条是 OpenAI News（反爬）。

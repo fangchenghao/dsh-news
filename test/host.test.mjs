@@ -617,6 +617,14 @@ test('selectCandidates: 候选不足上限时，单源 maxItems 仍然生效', (
   assert.equal(out.items.length, 2, '不足 maxCandidates 时也必须按单源上限裁剪');
 });
 
+test('resolveRedirect: 相对地址补全，非 http(s) 丢弃', () => {
+  assert.equal(news.resolveRedirect('/blog/x', 'https://deepmind.google/blog/y/'), 'https://deepmind.google/blog/x');
+  assert.equal(news.resolveRedirect('https://a.example/b', 'https://x.example/'), 'https://a.example/b');
+  assert.equal(news.resolveRedirect('javascript:alert(1)', 'https://x.example/'), '');
+  assert.equal(news.resolveRedirect('', 'https://x.example/'), '');
+  assert.equal(news.resolveRedirect('data:text/html,x', 'https://x.example/'), '');
+});
+
 test('parseRemoteCommit + hasUpdate: 判断远端是否更新', () => {
   const remote = news.parseRemoteCommit(JSON.stringify({
     sha: 'abcdef1234567890',
