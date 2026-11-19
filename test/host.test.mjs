@@ -4,9 +4,11 @@
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import { promises as fsp } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 
 import * as news from '../index.js';
 
@@ -629,6 +631,30 @@ test('resolveRedirect: 相对地址补全，非 http(s) 丢弃', () => {
   assert.equal(news.resolveRedirect('javascript:alert(1)', 'https://x.example/'), '');
   assert.equal(news.resolveRedirect('', 'https://x.example/'), '');
   assert.equal(news.resolveRedirect('data:text/html,x', 'https://x.example/'), '');
+});
+
+test('npm 依赖中的更新命令不会操作外层项目的 Git 仓库', async (t) => {
+  const project = await fsp.mkdtemp(path.join(os.tmpdir(), 'dsh-news-npm-'));
+  t.after(() => fsp.rm(project, { recursive: true, force: true }));
+  try {
+    execFileSync('git', ['init', '--quiet', '--template=', project]);
+  } catch (error) {
+    if (error.code === 'ENOENT') return t.skip('需要 git 才能模拟外层项目');
+    throw error;
+  }
+  execFileSync('git', [
+    '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', '-c', 'commit.gpgsign=false',
+    'commit', '--quiet', '--allow-empty', '-m', 'fixture',
+  ], { cwd: project });
+  const dir = path.join(project, 'node_modules', '@fffangchenghao', 'dsh-news', 'desktop');
+  await fsp.mkdir(dir, { recursive: true });
+  const file = path.join(dir, 'runtime.mjs');
+  await fsp.copyFile(new URL('../desktop/runtime.mjs', import.meta.url), file);
+  const installed = await import(pathToFileURL(file).href);
+  const runtime = installed.createRuntime({ root: path.join(project, 'data') });
+  const { body } = await runtime.handleUpdateApply();
+  assert.equal(body.ok, false);
+  assert.match(body.error, /不是 git 检出/);
 });
 
 test('parseRemoteCommit + hasUpdate: 判断远端是否更新', () => {

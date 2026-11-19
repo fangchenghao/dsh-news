@@ -1,5 +1,5 @@
 /**
- * @local/dsh-news —— 每日 AI 简报（宿主半体）
+ * @fffangchenghao/dsh-news —— 每日 AI 简报（宿主半体）
  *
  * 职责：抓取多源 → 去重排序 → 让模型逐条判断 keep/drop 并分类 → 对保留项逐条写中文总结
  *       → 落盘 digest/YYYY-MM-DD.{json,md} → 注入 systemPrompt → 定时生成 → 暴露 HTTP 接口。
@@ -43,7 +43,7 @@ import { fileURLToPath } from 'node:url';
 // 常量
 // ---------------------------------------------------------------------------
 
-export const PACKAGE_ID = '@local/dsh-news';
+export const PACKAGE_ID = '@fffangchenghao/dsh-news';
 /** 代码版本：`/api/dsh-news/state` 会回传，用来判断宿主是否已加载新版。 */
 export const CODE_VERSION = '0.15.0';
 export const SECTION_NAME = 'plugin:dsh-news-digest';
@@ -2963,11 +2963,15 @@ export function createRuntime(options = {}) {
     });
   }
 
+  // npm 安装可能位于另一个 Git 仓库里。更新命令只操作插件目录自己的检出。
+  const checkoutGit = (...args) => git(['--git-dir=.git', '--work-tree=.', ...args]);
+
   async function localRevision() {
-    const head = await git(['rev-parse', 'HEAD']);
+    const head = await checkoutGit('rev-parse', 'HEAD');
     if (!head.ok) return { ok: false, error: head.error, tracking: false };
-    const status = await git(['status', '--porcelain']);
-    const dirty = status.ok ? status.out.length > 0 : false;
+    const status = await checkoutGit('status', '--porcelain');
+    if (!status.ok) return { ok: false, error: status.error, tracking: false };
+    const dirty = status.out.length > 0;
     return { ok: true, sha: head.out, short: head.out.slice(0, 7), dirty, tracking: true };
   }
 
@@ -3060,7 +3064,7 @@ export function createRuntime(options = {}) {
     const proxy = proxyMode.mode === 'proxy' ? proxyMode.url : proxyMode.mode === 'direct' ? '' : await detectProxy().catch(() => '');
     const args = ['-c', 'user.name=dsh-news-updater', '-c', 'user.email=updater@users.noreply.github.com'];
     if (proxy) args.push('-c', `http.proxy=${proxy}`);
-    const pulled = await git([...args, 'pull', '--ff-only', 'origin', 'main']);
+    const pulled = await checkoutGit(...args, 'pull', '--ff-only', 'origin', 'main');
     if (!pulled.ok) return { ok: false, error: `git pull 失败：${pulled.error}` };
     const after = await localRevision();
     updateCache = { at: 0, value: null };

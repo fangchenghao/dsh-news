@@ -1,5 +1,5 @@
 window.__ModuleLoader__.load({
-  id: '@local/dsh-news',
+  id: '@fffangchenghao/dsh-news',
   factory(require) {
     const React = require('react')
     const h = React.createElement
@@ -88,7 +88,7 @@ window.__ModuleLoader__.load({
       updateRestart: '更新完成，重启 Harness 后生效',
       updateCurrent: '当前',
       updateRemote: '最新',
-      updateNotGit: '当前安装不是 git 检出，无法自动更新（重新克隆仓库后再装一次即可）',
+      updateNotGit: '请通过 Harness 的插件管理器更新这个安装包。',
       newSource: '新源',
       remove: '删除',
       test: '测试',

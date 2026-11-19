@@ -1,6 +1,6 @@
 # dsh-news 契约（host 半体 ↔ client 半体）
 
-包名 `@local/dsh-news`，插件行 id `dsh-news-digest`。
+包名 `@fffangchenghao/dsh-news`，插件行 id `dsh-news-digest`。
 宿主侧 `index.js`，浏览器侧 `client.js`。两边**只通过下面这份 HTTP + 数据结构约定耦合**，各自独立实现。
 
 ## 1. 文件布局（运行时）

@@ -11,25 +11,27 @@ ChatGPT 桌面版在本地 Work 或 Codex 聊天里使用。DeepSeek Harness 提
 
 ### DeepSeek Harness
 
-在当前 profile 运行以下安装命令。
+在 Harness 对话中使用插件管理器安装 npm 包。
 
+```text
+plugin_manager install_bundle target=@fffangchenghao/dsh-news
 ```
-plugin_manager install_bundle   target=/absolute/path/to/dsh-news
-```
 
-装好后：侧边栏出现「每日简报」阅读面板，设置 →「每日简报」是配置页。
+使用 Web profile 也可以在终端运行 `dsh plugin --profile web add @fffangchenghao/dsh-news`。安装后，在侧边栏打开「每日简报」，或在设置中调整兴趣与信息源。开发时可将 `install_bundle` 的 target 换成本地仓库的绝对路径。
 
-> 包名 `@local/dsh-news` 是本机 profile 里用的名字（未发布到 npm）；
-> 仓库里的 `cordis.patch.yml` 会把插件行 `dsh-news-digest` 插进 profile 组合。
+如果当前 profile 已启用旧的本地包 `@local/dsh-news`，切换到 npm 版时先停用旧包，再安装新包。两个版本沿用同一个插件行 ID，兴趣、反馈和历史简报都保存在 `~/.dsh/dsh-news`。 [npm 软件包](https://www.npmjs.com/package/@fffangchenghao/dsh-news)
 
 ### ChatGPT 桌面版
 
-在安装了 Node.js 22+、curl 和 Codex CLI 的电脑上，从仓库根目录运行以下命令。保留该目录作为本地插件市场。
+安装 Node.js 22+、curl 和 Codex CLI 后，在一个打算保留的目录中运行以下命令。
 
 ```bash
-codex plugin marketplace add .
+npm install @fffangchenghao/dsh-news
+codex plugin marketplace add ./node_modules/@fffangchenghao/dsh-news
 codex plugin add dsh-news@dsh-news-plugins
 ```
+
+从 GitHub 源码安装时，在仓库根目录运行 `codex plugin marketplace add .`，再运行上面的 `codex plugin add` 命令。
 
 在 ChatGPT 桌面版开启新的**本地 Work 或 Codex 聊天**，输入 `@` 选择「每日 AI 简报」，然后说「按我的兴趣整理今天的 AI 新闻」。也可以说「查看昨天的简报」、「重新抓取并筛选今天的新闻」或「以后优先看开源模型和有实测数据的工程文章」。普通请求会复用当天的归档。抓取、去重、探索配额和历史记录与 Harness 共用，桌面插件按聊天请求运行。 [本地插件说明](https://developers.openai.com/plugins/deploy/desktop-only)
 
