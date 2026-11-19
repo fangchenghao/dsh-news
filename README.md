@@ -24,7 +24,7 @@ plugin_manager install_bundle   target=/absolute/path/to/dsh-news
 
 ```bash
 node --check index.js && node --check client.js
-node --test test/host.test.mjs test/client.smoke.test.mjs   # 104 个用例，不联网
+npm test   # 离线运行宿主和阅读界面测试
 ```
 
 - `index.js` 宿主半体：抓取 / 解析 / 模型筛选 / 逐条摘要 / 定时 / HTTP 路由
@@ -33,11 +33,11 @@ node --test test/host.test.mjs test/client.smoke.test.mjs   # 104 个用例，�
 
 ## 它做什么
 
-1. 每天 `08:00`（可改）抓一遍你在源列表里勾选的源；
-2. 去掉重复条目，按时间倒序取最新 80 条交给模型；
-3. 模型按你写的**兴趣描述**逐条判断「保留 / 丢弃」，丢弃的也记理由；
-4. 对保留的每一条写 2–3 句中文总结；
-5. 结果落盘 + 侧边栏阅读界面呈现。**默认不注入 systemPrompt**（省上下文），需要时在设置里勾上才注入。
+1. 每天 `08:00`（可改）抓取已启用的信息源，也可以在阅读面板点「重新生成」并查看进度。
+2. 先排除过期和最近推过的新闻，再按信息源分配候选名额。默认看最近 3 天的稿件，跳过最近 7 天已推过的条目，最多送 80 条给模型。
+3. 模型按你的**兴趣描述**逐条决定留弃并记录理由。探索位只从符合领域要求的落选稿件里挑，空余名额用于常规保留项。
+4. 为入选稿件写中文摘要，优先复用最近 30 天的摘要缓存。
+5. 简报保存在本地，也能在侧边栏阅读。默认把前 10 条注入 systemPrompt，可在设置里关闭。
 
 ## 数据在哪
 
@@ -49,9 +49,9 @@ node --test test/host.test.mjs test/client.smoke.test.mjs   # 104 个用例，�
   cache/summaries.json    逐条摘要缓存（30 天，按条目 id）
 ```
 
-## 默认的 16 个源
+## 内置的 18 个源
 
-开箱启用 13 个：OpenAI News、Anthropic News（网页抓取）、Google DeepMind、Google AI Blog、HuggingFace Blog、The Verge AI、TechCrunch AI、Google News 关键词、Hacker News、arXiv cs.AI、Claude Code Releases（GitHub releases）、爱范儿、少数派。
+默认启用 OpenAI News、Anthropic News、Google DeepMind、Google AI Blog、Hugging Face Blog、The Verge AI、TechCrunch AI、Google News 关键词、Hacker News、arXiv cs.AI、Claude Code Releases、爱范儿、少数派、量子位，共 14 个。
 
 ## 论文源的闸门（0.4.0 起）
 
@@ -75,16 +75,14 @@ arXiv 每天 300 条，默认只让它贡献 **2 条候选**（源的「候选�
 
 ## 摘要怎么来的（0.3.0 起）
 
-每条保留项都会**再抓一次原文正文**（上限 2600 字）喂给模型，而不是只用 RSS 那行摘要——
-后者常常只有一百来字，写出来的总结只能是标题改写。提示词要求 3–6 句、200–300 字，
-并且必须保留原文里的具体数字、版本号、机构名。
+生成新摘要时，插件抓取最多 2600 字的原文正文，并要求模型用 3–6 句话写清具体数字、版本号和机构名。arXiv 的订阅摘要达到 200 字符时直接使用论文摘要，可省去一次网页请求。
 
 ## 候选怎么选（0.2.0 起）
 
 不是「按时间取最新 80 条」——那等于按更新频率发门票，官网/blog 这类低频源永远挤不进去。
 现在的规则是**每源保底 2 条 → 剩余按时间补齐 → 单源不超过上限**，保证官方源、arXiv、中文深度媒体每天都有位置。
 
-默认关闭 3 个（Reddit r/LocalLLaMA、B 站 UP 主、YouTube 频道）——它们需要你先配好 **RSSHub** 或能出网的代理，否则抓回来只有错误。
+默认关闭机器之心 Synced、Reddit r/LocalLLaMA、B 站 UP 主和 YouTube 频道。B 站与 YouTube 可通过自配的 RSSHub 抓取。
 
 ## 抓取通道（实测过的坑）
 
@@ -106,21 +104,4 @@ arXiv 每天 300 条，默认只让它贡献 **2 条候选**（源的「候选�
 ## 已知限制
 
 - **定时只在 Harness 进程活着时触发**。08:00 没开机就当天不生成，下次启动会补一次（当天没有才补，不覆盖已有结果）。
-- 生成一次要调 1 次筛选 + N 次逐条总结（默认模型开了 reasoning，实测 10 源 80 条 → 24 条保留，约 20 秒完成）。
-- `npm run` 之类的不存在：这是个零依赖 ESM 包，只用 `node:` 内置模块。
-
-## 开发
-
-```bash
-node --check index.js
-node --check client.js
-node --test test/host.test.mjs test/client.smoke.test.mjs   # 85 个用例，不联网
-```
-
-改完重新安装（会把改动链接进 profile）：
-
-```
-plugin_manager: install_bundle, target=/Users/dp/Documents/deepseek-harness/dsh-news
-```
-
-接口约定（HTTP + 数据结构）见 [CONTRACT.md](./CONTRACT.md)。
+- 通常只需一次模型筛选。大批候选的输出被截断或无法解析时，插件会分成两批各重试一次。探索挑选和缺少缓存的逐条摘要会另外调用模型。

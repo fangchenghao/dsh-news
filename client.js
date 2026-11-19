@@ -585,26 +585,6 @@ a.rssnews_set_itemTitle:hover{text-decoration:underline;text-underline-offset:3p
       return error && error.message ? error.message : String(error)
     }
 
-    async function postJson(path, payload) {
-      let res
-      try {
-        res = await withTimeout(path, {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify(payload || {}),
-        }, (r) => r, 25000)
-      } catch (error) {
-        throw new Error(T.errRequest + errText(error))
-      }
-      let body = null
-      try {
-        body = await res.json()
-      } catch {
-        throw new Error(T.errNotJson + res.status + '）')
-      }
-      return { res, body }
-    }
-
     async function callApi(path, init) {
       let status = 0
       const body = await withTimeout(path, init, async (res) => {
@@ -627,6 +607,11 @@ a.rssnews_set_itemTitle:hover{text-decoration:underline;text-underline-offset:3p
     }
 
     const readState = () => callApi('/api/dsh-news/state')
+    const readStatus = () => callApi('/api/dsh-news/state?view=status')
+    const triggerRefresh = () => callApi('/api/dsh-news/refresh', {
+      method: 'POST',
+      headers: { Prefer: 'respond-async' },
+    })
     const saveConfig = (patch) => callApi('/api/dsh-news/config', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -688,14 +673,6 @@ const testSource = (source) => callApi('/api/dsh-news/source/test', {
       })
       if (status >= 400) throw new Error((body && body.error) || 'HTTP ' + status)
       return body || { ok: true }
-    }
-
-    async function triggerRefresh() {
-      const { res, body } = await postJson('/api/dsh-news/refresh', {})
-      if (body && body.busy) return body
-      if (!res.ok) throw new Error((body && body.error) || 'HTTP ' + res.status)
-      if (body && body.ok === false) throw new Error(body.error || T.errGenerate)
-      return body
     }
 
     /* ---------------------------- 小工具 ---------------------------- */
@@ -979,7 +956,7 @@ function StatsBar(props) {
   const dropped = d.dropped || []
   const num = (v, fb) => (typeof v === 'number' ? v : fb)
   const cells = [
-    { label: '抓取', value: num(t.fetched, items.length + dropped.length) },
+    { label: '候选', value: num(t.fetched, items.length + dropped.length) },
     { label: '保留', value: num(t.kept, items.length), cls: 'is-accent' },
     { label: '滤掉', value: num(t.dropped, dropped.length), cls: 'is-muted' },
     { label: '已总结', value: num(t.summarized, items.filter(x => x && x.summary).length) }
@@ -1145,7 +1122,8 @@ function DigestAppendix(props) {
 function DigestColophon(props) {
   const d = props.digest
   const parts = ['由 DeepSeek Harness 生成']
-  parts.push(isFallbackMode(d.filterMode) ? '未筛选（时间倒序）' : '模型筛选')
+  parts.push(d.filterMode === 'no-candidates' ? '无新候选'
+    : isFallbackMode(d.filterMode) ? '未筛选（时间倒序）' : '模型筛选')
   if (Array.isArray(d.sources)) parts.push(d.sources.length + ' 个信息源')
   if (d.generatedAt) parts.push('生成于 ' + d.date + ' ' + fmtClock(d.generatedAt))
   return h('div', { className: 'rssnews_colophon' },
@@ -1210,7 +1188,7 @@ function DigestPanel() {
       if (d === localToday()) {
         const s = await readState()
         if (stale()) return
-        setRunning(!!(s && s.running))
+        if (s && s.running) setRunning(true)
         if (s && s.taste && s.taste.votes) setVotes(s.taste.votes)
         dg = (s && s.digest) || null
         if (dg && dg.date && dg.date !== d) dg = null
@@ -1259,20 +1237,21 @@ function DigestPanel() {
     const tick = async () => {
       if (cancelled || !alive.current) return
       try {
-        const s = await readState()
+        const s = await readStatus()
         if (cancelled || !alive.current) return
         if (s && s.running) { timer = setTimeout(tick, 5000); return }
         setRunning(false)
         setRefreshing(false)
+        setNotice(s.lastError ? { kind: 'danger', cap: '生成失败', text: s.lastError } : null)
         load(dateRef.current, { silent: true })
       } catch (e) {
-        if (!alive.current) return
+        if (cancelled || !alive.current) return
         setNotice({ kind: 'danger', cap: '状态查询失败', text: ((e && e.message) || String(e)) + '，5 秒后重试。' })
         timer = setTimeout(tick, 5000)
       }
     }
     timer = setTimeout(tick, 5000)
-    return () => clearTimeout(timer)
+    return () => { cancelled = true; clearTimeout(timer) }
   }, [running, load])
 
   const onRefresh = useCallback(async () => {
@@ -1284,14 +1263,10 @@ function DigestPanel() {
     try {
       const r = await triggerRefresh()
       if (!alive.current) return
-      if (r && r.busy) {
+      if (r && (r.running || r.busy)) {
         setRunning(true)
-        setNotice({ kind: 'info', cap: '已在生成', text: '已有一次生成在进行，完成后会自动刷新。' })
         return
       }
-      const s = await readState()
-      if (!alive.current) return
-      if (s && s.running) { setRunning(true); return }
       if (dateRef.current === t) await load(t, { silent: true })
     } catch (e) {
       if (!alive.current) return
@@ -1516,9 +1491,11 @@ function DigestPanel() {
         : h('button', { type: 'button', className: 'rssnews_btn', onClick: () => setDate(localToday()) }, '回到今天')
     })
   } else if (view && !groups.length) {
+    const noCandidates = view.filterMode === 'no-candidates'
     content = h(DigestState, {
-      title: '这一期没有保留下来的条目',
-      hint: '全部条目都被滤掉了，可以在下方「被滤掉」里查看每条的理由。'
+      title: noCandidates ? '今天没有符合条件的新条目' : '这一期没有保留下来的条目',
+      hint: noCandidates ? '源里的条目都已超过时效或在最近的简报中出现过。'
+        : '全部条目都被滤掉了，可以在下方「被滤掉」里查看每条的理由。'
     })
   } else if (view) {
     let no = 0

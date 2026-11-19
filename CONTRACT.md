@@ -23,6 +23,7 @@
 | 方法 | 路径 | 用途 |
 |---|---|---|
 | GET | `/api/dsh-news/state` | 一次性读全量：config + 当天 digest + 运行状态 |
+| GET | `/api/dsh-news/state?view=status` | 阅读面板轮询，返回 `{ok, running, lastError}`，直接读取内存状态 |
 | POST | `/api/dsh-news/refresh` | 立即重新抓取并生成（force）。生成中重复调用返回 `{ok:true, busy:true}` |
 | POST | `/api/dsh-news/config` | 保存配置，body 为 `Partial<Config>` |
 | POST | `/api/dsh-news/source/test` | body `{url, type}`，保存前试拉一次，返回条目标题样本 |
@@ -49,6 +50,7 @@
 
 - 成功：`{ ok: true, digest: <Digest> }`
 - 生成中：`{ ok: true, busy: true }`
+- 阅读面板发送 `Prefer: respond-async` 时，新任务立即返回 HTTP 202 和 `{ok:true, running:true}`。面板轮询至 `running:false`，成功后读取简报，失败时展示 `lastError`。其他客户端可继续使用同步响应。
 - 失败：`{ ok: false, error: "人话原因" }`
 
 `POST /api/dsh-news/config`：成功 `{ ok: true, config: <Config> }`；校验失败 `{ ok: false, error: "..." }`（如 `dailyTime` 不是 `HH:mm`）。
@@ -93,9 +95,9 @@ interface Digest {
   items: DigestItem[]           // 已按分类聚好序，保留项
   dropped: DroppedItem[]        // 被模型滤掉的（透明展示，最多 50 条）
   sources: SourceReport[]
-  totals: { fetched: number; kept: number; dropped: number; summarized: number }
+  totals: { fetched: number; kept: number; dropped: number; summarized: number } // fetched 为进入筛选的候选数，原始抓取数见 sources[].count
   errors: string[]              // 全局问题（如 "宿主 llm 服务不可用，未做筛选"）
-  filterMode: 'llm' | 'fallback' // llm = 模型判断；fallback = 模型不可用，按时间倒序全留
+  filterMode: 'llm' | 'fallback' | 'no-candidates' // no-candidates 表示抓取成功，所有条目都已过期或已推送
   markdown: string              // 给人读的全文（client 的"复制 Markdown"直接用）
 }
 ```
@@ -234,6 +236,8 @@ arXiv（300）**各 0 条**——官网/blog 类低频源在结构上被挤出�
    阅读界面 `.rssnews_itemBody` 用 `white-space: pre-line` 渲染；
 6. 缓存键加代际盐 `SUMMARY_CACHE_SALT`，改提示词或抓取策略时换盐，旧摘要自动失效。
 
+0.14.0 可同时处理最多 6 篇待抓取或待总结的稿件，其中最多 3 篇使用摘要模型。正文先就绪的稿件可以先生成摘要，结果仍按简报中的原顺序排列。模型路由不可用时，有效的缓存摘要也可直接展示。
+
 ## 12. 论文源与单源可达上限（0.4.0 起）
 
 arXiv cs.AI 每天推 300 条预印本，且时间戳都是当天，纯按时间排会把新闻挤掉
@@ -278,6 +282,8 @@ Google News 给的是 `news.google.com/rss/articles/...` 聚合链接，原始�
 同时把筛选调用的预算从 8192 提到 16384 tokens，并且**任何失败**（截断、解析失败、空返回）
 都用前一半候选重试一次——0.4.1 时只对「截断」重试，遇到「找不到 JSON 数组」直接退化成兜底模式，
 等于当天完全没做编辑筛选（2026-11-11 就是这个情况）。
+
+0.14.0 中，超过 12 条候选且模型输出截断、为空或无法解析时，全部候选分成两批并发重试。每批的序号独立解析，再映射回原位置。失败的批次记录原因，另一批的有效判断继续使用。模型服务报错或超时会直接走降级路径。
 
 ## 15. 反馈 → 品味 → 探索（0.5.0 起）
 
@@ -439,8 +445,9 @@ id，因为 URL 稳定）每天都会被重新推一次，投票自然跟着复�
 | `maxAgeDays` | 3 | 发布时间早于 N 天前的条目直接丢弃（0 = 不限制）。没有发布时间的条目保留——很多 feed 不带 date |
 | `repeatWindowDays` | 7 | 最近 N 天的简报里出现过的条目不再进候选（0 = 不限制）。**按 id 和归一化标题双重匹配**，换 URL 转载也挡得住 |
 
-实现：`filterFreshness()` / `filterRepeats()` 两个纯函数，在 `prepareCandidates` 之后、模型筛选之前执行，
-被过滤的条数写进 `errors`（用户能在「运行提示」里看到）。
+自 0.14.0 起，先按发布时间过滤，再按 URL 和带版本号的标题键去重、排除历史条目，最后才分配单源与全局候选名额。历史窗口按任务开始时的本地日历日期回溯。过滤数量记入 `errors`，每个源的抓取数量保存在 `sources[].count`。
+
+当各源都成功、抓到了条目且全部已过期或已推送，插件保存 `no-candidates` 简报，定时器当天即可结束。若各源均返回零条，或部分源失败且没有可用的新稿，生成仍报错并保留重试机会。
 
 用 11-18 的真实数据验证：25 条里有 3 条超龄（其中 1 条是 2025 年的），再叠加 7 天重复过滤又跳过 1 条，
 最终 21 条。设置页两项都可调，设 0 即恢复旧行为。

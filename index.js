@@ -18,7 +18,7 @@
  *   3. 瞬时失败（000 / 429 / 5xx）：同一通道重试一次。
  *   4. 模型路由解析不到：filterMode='fallback'，按时间倒序全留，并在 errors 说明原因（不是抛错）。
  *   5. 模型调用 / JSON 解析失败：同样是 fallback + errors，附上人话原因。
- *   6. finish.kind === 'max-tokens'：单独报"输出被 maxTokens 截断"，并尝试用一半候选重试一次。
+ *   6. 大批候选的输出被截断或无法解析：分两批各试一次，保留每批成功取得的判断。
  *   7. 逐条摘要失败 / 整体超时预算：该条 summary 留空，errors 里逐条记原因。
  *   8. 全部源都没有可用条目：直接报错（不写一份假的空简报），路由返回 ok=false。
  *   9. 摘要缓存读写失败：当作没有缓存继续，不阻塞生成。
@@ -45,7 +45,7 @@ import { fileURLToPath } from 'node:url';
 
 export const PACKAGE_ID = '@local/dsh-news';
 /** 代码版本：`/api/dsh-news/state` 会回传，用来判断宿主是否已加载新版。 */
-export const CODE_VERSION = '0.13.0';
+export const CODE_VERSION = '0.14.0';
 export const SECTION_NAME = 'plugin:dsh-news-digest';
 export const SECTION_ORDER = 160;
 
@@ -108,6 +108,7 @@ const DISTILL_EVERY = 25;
 
 /** 候选选择：每个源在「保底轮」拿到的条数。 */
 const RESERVE_PER_SOURCE = 2;
+const DUPLICATE_THRESHOLD = 0.82;
 const PROXY_PORTS = [7890, 1087, 8888, 6152];
 const PROXY_TIMEOUT_MS = 300;
 const PROXY_CACHE_MS = 60_000;
@@ -567,10 +568,6 @@ export function digestId(url, title) {
 }
 
 /**
- * 去重（规范化 URL + 标题）→ 按发布时间倒序 → 截断到 maxCandidates。
- * 返回 { items, total }，total 是去重后的总数（用于如实告知被截掉了多少）。
- */
-/**
  * 候选选择：先「每源保底」，再「按时间补齐」，并给单源设上限。
  *
  * 为什么不是纯按时间倒序截断：那等于按更新频率发门票——Google News 一小时几十条，
@@ -585,12 +582,11 @@ export function digestId(url, title) {
 export function selectCandidates(unique, maxCandidates = 80, options = {}) {
   const list = Array.isArray(unique) ? unique : [];
   const limit = Number.isInteger(maxCandidates) && maxCandidates > 0 ? maxCandidates : 80;
-  const sourceLimitsEarly = options.sourceLimits && typeof options.sourceLimits === 'object'
-    ? options.sourceLimits
-    : {};
-  const hasSourceLimits = Object.keys(sourceLimitsEarly).length > 0;
-  if (list.length <= limit && !hasSourceLimits) {
-    return { items: list.slice(), perSourceCap: null, dropped: 0 };
+  const newestFirst = (left, right) => timeValue(right.publishedAt) - timeValue(left.publishedAt);
+  const sorted = list.slice().sort(newestFirst);
+  const sourceLimits = options.sourceLimits ?? {};
+  if (sorted.length <= limit && Object.keys(sourceLimits).length === 0) {
+    return { items: sorted, perSourceCap: null, dropped: 0 };
   }
 
   const reserve =
@@ -601,28 +597,18 @@ export function selectCandidates(unique, maxCandidates = 80, options = {}) {
 
   const sourceKeyOf = (item) => String(item.sourceId ?? item.source ?? '未知');
   const groups = new Map();
-  for (const item of list) {
+  const pool = [];
+  for (const item of sorted) {
     const key = sourceKeyOf(item);
     if (!groups.has(key)) groups.set(key, []);
-    groups.get(key).push(item);
+    const group = groups.get(key);
+    const cap = Number(sourceLimits[key]);
+    if (Number.isInteger(cap) && cap > 0 && group.length >= cap) continue;
+    group.push(item);
+    pool.push(item);
   }
-  // 单源候选上限（source.maxItems）：在分组这一层就砍掉，后面的保底/补齐都受影响
-  const sourceLimits = options.sourceLimits && typeof options.sourceLimits === 'object'
-    ? options.sourceLimits
-    : {};
-  for (const [key, items] of groups) {
-    const raw = Number(sourceLimits[key]);
-    if (Number.isInteger(raw) && raw > 0 && items.length > raw) {
-      groups.set(key, items.slice(0, raw));
-    }
-  }
-  // 补齐轮必须在这个「已裁剪」的池子里挑，否则被砍掉的条目会在第二轮又溜回来
-  const pool = [...groups.values()]
-    .flat()
-    .sort((left, right) => timeValue(right.publishedAt) - timeValue(left.publishedAt));
-  // 单源上限砍完可能已经不足 limit：这时直接返回，别再往下走保底轮
   if (pool.length <= limit) {
-    return { items: pool.slice(), perSourceCap: null, dropped: list.length - pool.length };
+    return { items: pool, perSourceCap: null, dropped: list.length - pool.length };
   }
 
   // 单源上限：源越少越宽松（只有 1 个源时等于不设限），源越多越收紧。
@@ -645,14 +631,10 @@ export function selectCandidates(unique, maxCandidates = 80, options = {}) {
   };
 
   // 第一轮：每源保底
-  const order = [...groups.keys()].sort(
-    (a, b) => timeValue(groups.get(b)[0]?.publishedAt) - timeValue(groups.get(a)[0]?.publishedAt),
-  );
-  for (let round = 0; round < reserve && picked.length < limit; round += 1) {
+  for (let round = 0; round < Math.min(reserve, perSourceCap) && picked.length < limit; round += 1) {
     let added = 0;
-    for (const key of order) {
+    for (const group of groups.values()) {
       if (picked.length >= limit) break;
-      const group = groups.get(key);
       if (group.length > round) {
         take(group[round]);
         added += 1;
@@ -677,7 +659,7 @@ export function selectCandidates(unique, maxCandidates = 80, options = {}) {
     take(item);
   }
 
-  picked.sort((left, right) => timeValue(right.publishedAt) - timeValue(left.publishedAt));
+  picked.sort(newestFirst);
   return { items: picked, perSourceCap, dropped: list.length - picked.length };
 }
 
@@ -688,15 +670,14 @@ export function prepareCandidates(rawItems, maxCandidates = 80, options = {}) {
   const seenTitles = new Set();
   const unique = [];
 
-  for (const raw of list) {
-    if (!isPlainObject(raw)) continue;
+  function add(raw) {
     const title = oneLine(raw.title);
     const url = String(raw.url ?? '').trim();
-    if (!title || !isHttpUrl(url)) continue;
+    if (!title || !isHttpUrl(url)) return;
     const urlKey = normalizeUrl(url);
-    const titleKey = normalizeTitle(stripOutletSuffix(title, raw.source));
-    if (!urlKey || !titleKey) continue;
-    if (seenUrls.has(urlKey) || seenTitles.has(titleKey)) continue;
+    const titleKey = normalizeTitleForDedup(title, raw.source);
+    if (!urlKey || !titleKey) return;
+    if (seenUrls.has(urlKey) || seenTitles.has(titleKey)) return;
     seenUrls.add(urlKey);
     seenTitles.add(titleKey);
     unique.push({
@@ -708,14 +689,23 @@ export function prepareCandidates(rawItems, maxCandidates = 80, options = {}) {
       id: digestId(url, title),
     });
   }
+  // 同标题的聚合链接可能只打开中转页，先让原始报道进入去重表。
+  const aggregators = [];
+  for (const raw of list) {
+    if (!isPlainObject(raw)) continue;
+    if (isAggregator(raw)) aggregators.push(raw);
+    else add(raw);
+  }
+  for (const raw of aggregators) add(raw);
 
-  unique.sort((left, right) => timeValue(right.publishedAt) - timeValue(left.publishedAt));
-  const selected = selectCandidates(unique, limit, options);
+  const eligible = filterRepeats(unique, options);
+  const selected = selectCandidates(eligible.items, limit, options);
   return {
     items: selected.items,
     total: unique.length,
     perSourceCap: selected.perSourceCap,
-    truncated: unique.length - selected.items.length,
+    repeated: eligible.dropped.length,
+    truncated: selected.dropped,
   };
 }
 
@@ -1028,6 +1018,22 @@ async function mapPool(items, limit, fn) {
   return results;
 }
 
+/** 把释放的名额交给最先等待的任务，失败也会释放名额。 */
+function limitConcurrency(limit) {
+  let available = limit;
+  const waiting = [];
+  return async (run) => {
+    if (available > 0) available -= 1;
+    else await new Promise((resolve) => waiting.push(resolve));
+    try {
+      return await run();
+    } finally {
+      if (waiting.length) waiting.shift()();
+      else available += 1;
+    }
+  };
+}
+
 function delay(ms) {
   // 不要 unref：这个 promise 是被 await 的，unref 后在无其它句柄时进程会直接退出
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -1091,6 +1097,19 @@ function isLoopbackUrl(value) {
   }
 }
 
+async function* fetchChannels(proxySetting, url, detectProxy) {
+  const mode = parseProxyMode(proxySetting);
+  if (mode.mode === 'proxy') {
+    yield { via: 'proxy', proxy: mode.url };
+    return;
+  }
+  yield { via: 'direct', proxy: '' };
+  if (mode.mode === 'auto' && !isLoopbackUrl(url)) {
+    const proxy = await detectProxy();
+    if (proxy) yield { via: 'proxy', proxy };
+  }
+}
+
 /**
  * 按 config.proxy 语义抓一个源：
  *   ''（自动）→ 先直连，失败再走探测到的本机代理
@@ -1115,34 +1134,11 @@ async function fetchSource(source, config, deps) {
     return { report, items: [] };
   }
 
-  const proxyMode = parseProxyMode(config.proxy);
-  const channels = [];
-  if (proxyMode.mode === 'direct') {
-    channels.push({ via: 'direct', proxy: '' });
-  } else if (proxyMode.mode === 'proxy') {
-    channels.push({ via: 'proxy', proxy: proxyMode.url });
-  } else {
-    channels.push({ via: 'direct', proxy: '' });
-    // 代理探测放到最后：直连成功时完全不需要它，探测本身也要花时间
-    channels.push({ via: 'proxy', proxy: null, lazy: true });
-  }
-
   const problems = [];
   let lastVia = '';
-  for (const channel of channels) {
+  for await (const channel of fetchChannels(config.proxy, resolved.url, detectProxy)) {
     lastVia = channel.via;
-    let proxyValue = channel.proxy;
-    if (channel.lazy) {
-      // 回环地址（如本机 RSSHub）走代理没意义，直接跳过这一通道
-      if (isLoopbackUrl(resolved.url)) continue;
-      try {
-        proxyValue = await detectProxy();
-      } catch {
-        proxyValue = '';
-      }
-      if (!proxyValue) continue;
-    }
-    const outcome = await fetchParseWithRetry(source, resolved.url, execCurl, proxyValue);
+    const outcome = await fetchParseWithRetry(source, resolved.url, execCurl, channel.proxy);
     if (!outcome.error) {
       report.ok = true;
       report.count = outcome.items.length;
@@ -1239,14 +1235,13 @@ export function resolveModelRoute(config, agentSelection, settingsValue) {
 // Prompt 构建 / 模型调用 / 结果解析
 // ---------------------------------------------------------------------------
 
-/**
- * 去掉媒体后缀，供「是不是同一件事」判断用。
- * 例：「特努斯施压 Siri 掌门人，苹果 AI 不能再等了 - 爱范儿」→ 去掉尾部「 - 爱范儿」
- */
+function numberSequence(text) {
+  return (text.match(/\d+(?:\.\d+)*/g) || []).join(',');
+}
+
 /** 从原始标题里提取数字/版本序列（用于去重时保护 1.10 vs 11.0 这类差异）。 */
 export function titleVersionKey(title, source) {
-  const base = stripOutletSuffix(title, source);
-  return (base.match(/\d+(?:\.\d+)*/g) || []).join(',');
+  return numberSequence(stripOutletSuffix(title, source));
 }
 
 const KNOWN_OUTLETS = [
@@ -1274,10 +1269,10 @@ export function stripOutletSuffix(title, source) {
 }
 
 export function normalizeTitleForDedup(title, source) {
-  let s = stripOutletSuffix(title, source);
-  s = s.replace(/[「」『』“”"'’·、，。！？：；,.!?:;()（）\[\]【】]/g, '');
-  s = s.replace(/\s+/g, '');
-  return s.toLowerCase();
+  const base = stripOutletSuffix(title, source);
+  const norm = normalizeTitle(base);
+  const versions = numberSequence(base);
+  return versions ? norm + '|' + versions : norm;
 }
 
 function charBigrams(text) {
@@ -1290,12 +1285,31 @@ function charBigrams(text) {
 
 /** 标题相似度（字符二元组 Jaccard），中文英文都能用。 */
 export function titleSimilarity(a, b) {
-  const left = charBigrams(a);
-  const right = charBigrams(b);
+  return bigramSimilarity(charBigrams(a), charBigrams(b));
+}
+
+function bigramSimilarity(left, right) {
   if (left.size === 0 || right.size === 0) return 0;
   let inter = 0;
   for (const gram of left) if (right.has(gram)) inter += 1;
   return inter / (left.size + right.size - inter);
+}
+
+function headlineSignature(item) {
+  const base = stripOutletSuffix(item.title, item.source);
+  const norm = base.replace(/[「」『』“”"'’·、，。！？：；,.!?:;()（）\[\]【】\s]/g, '').toLowerCase();
+  return { norm, digits: numberSequence(base), grams: charBigrams(norm) };
+}
+
+function sameHeadline(left, right, threshold) {
+  if (left.digits !== right.digits) return false;
+  if (left.norm === right.norm) return true;
+  if (left.norm.length < 8 || right.norm.length < 8) return false;
+  return bigramSimilarity(left.grams, right.grams) >= threshold;
+}
+
+function isAggregator(item) {
+  return item.sourceType === 'google-news' || /^google-news/i.test(item.sourceId ?? '') || /Google News/i.test(item.source ?? '');
 }
 
 /**
@@ -1304,37 +1318,31 @@ export function titleSimilarity(a, b) {
  * 标题往往只差一个媒体后缀，URL 却完全不同，前面按 URL/标题的精确去重拦不住。
  */
 export function collapseDuplicates(items, options = {}) {
-  const threshold = Number.isFinite(options.threshold) ? options.threshold : 0.82;
-  const isAggregator = (item) =>
-    /^google-news/i.test(String(item.sourceId ?? '')) || /Google News/i.test(String(item.source ?? ''));
+  const threshold = Number.isFinite(options.threshold) ? options.threshold : DUPLICATE_THRESHOLD;
   const richness = (item) =>
     String(item.summary ?? '').length * 2 + String(item.excerpt ?? '').length;
   const kept = [];
+  const signatures = [];
   const dropped = [];
   for (const item of items) {
-    const norm = normalizeTitleForDedup(item.title, item.source);
-    const digits = titleVersionKey(item.title, item.source);
-    const hit = kept.findIndex((k) => {
-      // 归一化会删掉点，Model 1.10 与 Model 11.0 会撞成同一个键：版本序列不同就不算重复
-      if (k.norm === norm) return k.digits === digits;
-      // 短标题容易误判；数字/版本号不同基本就是两条不同的东西（Story 1 vs Story 2、iOS 27.3 vs 27.4）
-      if (norm.length < 8 || k.norm.length < 8) return false;
-      if (k.digits !== digits) return false;
-      return titleSimilarity(k.norm, norm) >= threshold;
-    });
+    const signature = headlineSignature(item);
+    const hit = signatures.findIndex((other) => sameHeadline(other, signature, threshold));
     if (hit === -1) {
-      kept.push({ ...item, norm, digits });
+      kept.push(item);
+      signatures.push(signature);
       continue;
     }
     const existing = kept[hit];
-    let takeNew = richness(item) > richness(existing) + 40;
-    if (!takeNew && isAggregator(existing) && !isAggregator(item)) takeNew = true;
+    const takeNew = isAggregator(item) === isAggregator(existing)
+      ? richness(item) > richness(existing) + 40
+      : isAggregator(existing);
     if (takeNew) {
       dropped.push({
         ...existing,
         reason: `与「${truncate(item.title, 30)}」是同一件事（自动合并，保留信息更全的一条）`,
       });
-      kept[hit] = { ...item, norm, digits };
+      kept[hit] = item;
+      signatures[hit] = signature;
     } else {
       dropped.push({
         ...item,
@@ -1342,7 +1350,7 @@ export function collapseDuplicates(items, options = {}) {
       });
     }
   }
-  return { kept: kept.map(({ norm, digits: _d, ...rest }) => rest), dropped };
+  return { kept: kept.map((item) => ({ ...item })), dropped };
 }
 
 // ---------------------------------------------------------------------------
@@ -1586,7 +1594,7 @@ export function filterRepeats(items, options = {}) {
   const kept = [];
   const dropped = [];
   for (const item of list) {
-    const titleKey = normalizeTitleForDedup(item.title, item.source);
+    const titleKey = item.titleKey ?? normalizeTitleForDedup(item.title, item.source);
     if (seenIds.has(item.id) || (titleKey && seenTitles.has(titleKey))) dropped.push(item);
     else kept.push(item);
   }
@@ -1639,6 +1647,14 @@ export function buildFilterPrompt(config, candidates, tasteProfile) {
   return { system, prompt: lines.join('\n') };
 }
 
+function hasArxivAbstract(item) {
+  if (typeof item.excerpt !== 'string' || item.excerpt.trim().length < 200) return false;
+  return attempt(() => {
+    const url = new URL(item.url);
+    return /(^|\.)arxiv\.org$/i.test(url.hostname) && /^\/(abs|pdf|html)\//.test(url.pathname);
+  }, false);
+}
+
 /** 逐条摘要用的 system + user prompt。 */
 export function buildSummaryPrompt(item) {
   const lines = [`标题：${oneLine(item.title)}`, `来源：${oneLine(item.source)}`];
@@ -1647,11 +1663,11 @@ export function buildSummaryPrompt(item) {
   const body = typeof item.body === 'string' ? item.body.trim() : '';
   const excerpt = typeof item.excerpt === 'string' ? item.excerpt.trim() : '';
   // arXiv 的 abs 页面正文基本是 arXivLabs 样板字，真正的摘要在 RSS description 里
-  const preferExcerpt = /arxiv\.org/i.test(String(item.url ?? '')) && excerpt.length >= 200;
+  const preferExcerpt = hasArxivAbstract(item);
   let ask = '';
   if (item.compact) {
     // 上一轮被 maxTokens 截断：只给最要紧的素材，要求写短
-    const material = truncate(body || excerpt || '', 900);
+    const material = truncate(preferExcerpt ? excerpt : body || excerpt, 900);
     if (material) lines.push('', '【素材（节选）】', material);
     ask = '素材有限：请用 2 句简体中文说清这条讲了什么（不超过 80 字），不要铺开。';
   } else if (preferExcerpt) {
@@ -1942,8 +1958,9 @@ export function buildMarkdown(digest) {
   const sources = Array.isArray(digest?.sources) ? digest.sources : [];
 
   const lines = [`# 每日 AI 简报 · ${digest?.date ?? ''}`, ''];
-  const modeText = digest?.filterMode === 'llm' ? '模型判断' : '兜底模式（未做模型筛选）';
-  lines.push(`> 抓取 ${totals.fetched} 条，保留 ${totals.kept} 条，滤掉 ${totals.dropped} 条。筛选方式：${modeText}。`);
+  const modeText = digest?.filterMode === 'no-candidates' ? '没有符合时效和去重条件的新条目'
+    : digest?.filterMode === 'llm' ? '模型判断' : '兜底模式（未做模型筛选）';
+  lines.push(`> 候选 ${totals.fetched} 条，保留 ${totals.kept} 条，滤掉 ${totals.dropped} 条。筛选方式：${modeText}。`);
   lines.push('');
   if (items.length === 0) {
     lines.push('今天没有保留任何条目。', '');
@@ -2541,6 +2558,8 @@ class HttpError extends Error {
   }
 }
 
+class ModelOutputError extends Error {}
+
 function sendJson(response, status, body) {
   const payload = JSON.stringify(body ?? { ok: false });
   try {
@@ -2787,6 +2806,8 @@ export function createRuntime(options = {}) {
   }
 
   async function routeFor(config) {
+    const configured = resolveModelRoute(config);
+    if (configured) return configured;
     let agentSelection;
     try {
       const service = ctx.get?.('agentDefaultModel');
@@ -2794,6 +2815,8 @@ export function createRuntime(options = {}) {
     } catch (error) {
       log.debug(`agentDefaultModel 不可用：${messageOf(error)}`);
     }
+    const agentRoute = resolveModelRoute(config, agentSelection);
+    if (agentRoute) return agentRoute;
     let settingsValue;
     try {
       const settings = ctx.get?.('settings');
@@ -2809,19 +2832,9 @@ export function createRuntime(options = {}) {
     if (!llm || typeof llm.stream !== 'function') throw new Error('宿主没有可用的 llm 服务（llm.stream 不可用）');
 
     const controller = new AbortController();
-    const timer = setTimeout(() => {
-      try {
-        controller.abort();
-      } catch {
-        /* ignore */
-      }
-    }, timeoutMs);
-    if (typeof timer.unref === 'function') timer.unref();
-
     let text = '';
     let finishKind;
-    let failure;
-    try {
+    const consume = async () => {
       const stream = llm.stream({
         provider: route.provider,
         model: route.model,
@@ -2833,6 +2846,7 @@ export function createRuntime(options = {}) {
         signal: controller.signal,
       });
       for await (const chunk of stream) {
+        if (controller.signal.aborted) return;
         if (!chunk || typeof chunk !== 'object') continue;
         if (chunk.type === 'text-delta') {
           if (typeof chunk.text === 'string') text += chunk.text;
@@ -2840,29 +2854,40 @@ export function createRuntime(options = {}) {
           // 坑 2：kind 在 reason 里面（也兼容 reason 直接是字符串的宿主）。
           const reason = chunk.reason;
           finishKind = typeof reason === 'string' ? reason : reason?.kind;
+          break;
         } else if (chunk.type === 'error') {
           const detail = chunk.error?.message ?? chunk.error ?? '模型返回 error 块';
-          failure = messageOf(detail);
-          break;
+          throw new Error(messageOf(detail));
         }
       }
+    };
+    // 有的宿主流不会响应 signal，仍须让这次生成按时退出等待。
+    let timer;
+    const timeout = new Promise((_, reject) => {
+      timer = setTimeout(() => {
+        const error = new Error(`${label}超时（${Math.round(timeoutMs / 1000)} 秒）`);
+        controller.abort(error);
+        reject(error);
+      }, timeoutMs);
+    });
+    try {
+      await Promise.race([consume(), timeout]);
     } catch (error) {
-      const prefix = controller.signal.aborted ? `${label}超时（${Math.round(timeoutMs / 1000)} 秒）` : `${label}调用失败`;
-      throw new Error(`${prefix}：${messageOf(error)}`);
+      if (controller.signal.aborted) throw controller.signal.reason;
+      throw new Error(`${label}调用失败：${messageOf(error)}`);
     } finally {
       clearTimeout(timer);
     }
 
-    if (failure) throw new Error(`${label}调用失败：${failure}`);
     if (finishKind === 'max-tokens') {
-      throw new Error(
+      throw new ModelOutputError(
         `${label}失败：输出被 maxTokens（${maxTokens}）截断；推理模型会先吃掉预算，可减少候选条目或换非推理模型`,
       );
     }
     if (finishKind !== 'stop') {
       throw new Error(`${label}失败：模型没有正常结束（finish=${finishKind === undefined ? '缺失' : String(finishKind)}）`);
     }
-    if (!text.trim()) throw new Error(`${label}失败：模型返回了空文本`);
+    if (!text.trim()) throw new ModelOutputError(`${label}失败：模型返回了空文本`);
     return text;
   }
 
@@ -2880,25 +2905,33 @@ export function createRuntime(options = {}) {
         timeoutMs: FILTER_TIMEOUT_MS,
         label: '模型筛选',
       });
-      return parseFilterResponse(text, list.length);
+      try {
+        return parseFilterResponse(text, list.length);
+      } catch (error) {
+        throw new ModelOutputError(messageOf(error));
+      }
     };
 
     try {
       return await runOnce(candidates);
     } catch (error) {
-      const message = messageOf(error);
-      if (candidates.length <= 12) throw error;
-      // 截断、解析失败、返回空——都值得用一半候选再试一次（80 条一次性输出本来就容易崩）
-      const half = candidates.slice(0, Math.ceil(candidates.length / 2));
-      errors.push(`模型筛选没成功（${message}），改为只用前 ${half.length} 条候选重试一次`);
-      const parsed = await runOnce(half);
-      parsed.results = [
-        ...parsed.results,
-        ...new Array(candidates.length - half.length).fill(null),
-      ];
-      parsed.missing = parsed.missing.concat(
-        Array.from({ length: candidates.length - half.length }, (_, index) => half.length + index),
-      );
+      if (!(error instanceof ModelOutputError) || candidates.length <= 12) throw error;
+      const middle = Math.ceil(candidates.length / 2);
+      const batches = [candidates.slice(0, middle), candidates.slice(middle)];
+      errors.push(`模型筛选输出不完整（${messageOf(error)}），将全部候选分两批各重试一次`);
+      const outcomes = await Promise.allSettled(batches.map(runOnce));
+      const parsed = { results: [], duplicates: 0, unknownKeep: 0 };
+      for (const [i, outcome] of outcomes.entries()) {
+        if (outcome.status === 'rejected') {
+          errors.push(`第 ${i + 1} 批筛选失败：${messageOf(outcome.reason)}`);
+          parsed.results.push(...Array(batches[i].length).fill(null));
+        } else {
+          parsed.results.push(...outcome.value.results);
+          parsed.duplicates += outcome.value.duplicates;
+          parsed.unknownKeep += outcome.value.unknownKeep;
+        }
+      }
+      if (parsed.results.every((result) => result === null)) throw error;
       return parsed;
     }
   }
@@ -3133,28 +3166,20 @@ export function createRuntime(options = {}) {
    * 早先的 `--max-redirs 0` 让这些页面全部变成「没有正文」。
    * 现在手动逐跳跟随，并对**每一跳**重新做协议与内网校验（这才是挡 SSRF 的正确位置）。
    */
-  async function readArticleBody(url, config) {
+  async function readArticleBody(url, config, deadline) {
     if (!isHttpUrl(url)) return '';
     if (isPrivateUrl(url) || isLoopbackUrl(url)) return '';
 
-    const proxyMode = parseProxyMode(config?.proxy);
-    const channels = [];
-    if (proxyMode.mode === 'direct') channels.push('');
-    else if (proxyMode.mode === 'proxy') channels.push(proxyMode.url);
-    else {
-      channels.push('');
-      const detected = await detectProxy().catch(() => '');
-      if (detected) channels.push(detected);
-    }
-
-    for (const proxy of channels) {
+    for await (const { proxy } of fetchChannels(config.proxy, url, detectProxy)) {
       let target = url;
-      for (let hop = 0; hop < MAX_ARTICLE_REDIRECTS; hop += 1) {
+      for (let hop = 0; hop <= MAX_ARTICLE_REDIRECTS; hop += 1) {
+        const timeoutMs = Math.min(ARTICLE_TIMEOUT_MS, deadline - clock().getTime());
+        if (timeoutMs <= 0) return '';
         let response;
         try {
           response = await execCurl(target, {
             proxy,
-            timeoutMs: ARTICLE_TIMEOUT_MS,
+            timeoutMs,
             noRedirect: true,
             captureRedirect: true,
           });
@@ -3167,7 +3192,7 @@ export function createRuntime(options = {}) {
           if (!next) break;
           if (isPrivateUrl(next) || isLoopbackUrl(next)) {
             // 跳到内网：直接放弃这篇，不跟随
-            break;
+            return '';
           }
           target = next;
           continue;
@@ -3183,22 +3208,25 @@ export function createRuntime(options = {}) {
     return '';
   }
 
-  let exploreHints = { keptSources: [], keptCategories: [] };
-  function configureExplorationHints(hints) {
-    exploreHints = { ...exploreHints, ...hints };
-  }
-
   /**
    * 探索位：领域闸门（AI/科技/科学）先筛一遍，再让模型从里面挑主题分散的几条。
    * 模型不可用或输出不合法时，退回 pickExploration 的启发式排序。
    */
-  async function pickExplorationItems(pool, count, config, route, errors) {
-    const gated = (Array.isArray(pool) ? pool : []).filter((item) => isExplorationDomain(item));
-    if (gated.length === 0 || count <= 0) return [];
+  async function pickExplorationItems(pool, count, kept, seed, route, errors) {
+    if (!count || !pool.length) return [];
+    const seen = kept.map(headlineSignature);
+    const gated = pool.filter((item) => {
+      if (!isExplorationDomain(item)) return false;
+      const signature = headlineSignature(item);
+      if (seen.some((other) => sameHeadline(other, signature, DUPLICATE_THRESHOLD))) return false;
+      seen.push(signature);
+      return true;
+    });
+    if (!gated.length) return [];
     const heuristic = () => pickExploration(gated, Math.min(count, gated.length), {
-      seed: `${today()}|${String(config.interests ?? '').slice(0, 40)}`,
-      keptSources: exploreHints.keptSources,
-      keptCategories: exploreHints.keptCategories,
+      seed,
+      keptSources: kept.map((item) => item.source),
+      keptCategories: kept.map((item) => item.category),
     });
     if (!route) return heuristic();
     try {
@@ -3226,10 +3254,6 @@ export function createRuntime(options = {}) {
 
   async function summarizeItems(items, config, route, errors, deadline) {
     if (items.length === 0) return 0;
-    if (!route) {
-      errors.push('模型不可用，本次没有生成逐条中文总结（条目只有标题与源摘要可用）');
-      return 0;
-    }
 
     const read = await readJsonFile(cacheFile);
     if (!read.ok && read.error !== 'ENOENT') errors.push(`摘要缓存读取失败（当作空缓存继续）：${read.error}`);
@@ -3238,8 +3262,19 @@ export function createRuntime(options = {}) {
     let summarized = 0;
     let skipped = 0;
     let noBody = 0;
+    let noModel = 0;
 
-    await mapPool(items, SUMMARY_CONCURRENCY, async (item) => {
+    // 最多 6 条在抓取或总结途中，正文先就绪的先用模型，模型并发仍最多 3 条。
+    const withModelSlot = limitConcurrency(SUMMARY_CONCURRENCY);
+    const ask = (item, body, compact = false) => callModel({
+      route,
+      ...buildSummaryPrompt({ ...item, body, compact }),
+      maxTokens: compact ? 900 : 2_400,
+      temperature: 0.3,
+      timeoutMs: Math.min(SUMMARY_TIMEOUT_MS, deadline - clock().getTime()),
+      label: compact ? '摘要生成（紧凑重试）' : '摘要生成',
+    });
+    await mapPool(items, FETCH_CONCURRENCY, async (item) => {
       const key = summaryCacheKey(item.id);
       const hit = key ? cache.entries[key] : undefined;
       if (hit && typeof hit.summary === 'string' && hit.summary.trim()) {
@@ -3247,65 +3282,47 @@ export function createRuntime(options = {}) {
         summarized += 1;
         return;
       }
-      if (clock().getTime() > deadline) {
+      if (!route) {
+        noModel += 1;
+        return;
+      }
+      if (clock().getTime() >= deadline) {
         skipped += 1;
         return;
       }
       try {
-        // 摘要质量的天花板是输入：RSS 的一句话摘要写不出细节，先去抓正文。
-        let body = '';
-        if (clock().getTime() < deadline) {
+        const useAbstract = hasArxivAbstract(item);
+        const body = useAbstract ? '' : await readArticleBody(item.url, config, deadline).catch(() => '');
+        const text = await withModelSlot(async () => {
+          if (clock().getTime() >= deadline) return null;
           try {
-            body = await readArticleBody(item.url, config);
-          } catch {
-            body = '';
+            return await ask(item, body);
+          } catch (error) {
+            if (!(error instanceof ModelOutputError) || !/maxTokens/.test(error.message)) throw error;
+            if (clock().getTime() >= deadline) return null;
+            return ask(item, body, true);
           }
-        }
-        if (!body) noBody += 1;
-        const { system, prompt } = buildSummaryPrompt(Object.assign({}, item, { body }));
-        const askOnce = async (tokens) => callModel({
-          route,
-          system,
-          prompt,
-          maxTokens: tokens,
-          temperature: 0.3,
-          timeoutMs: SUMMARY_TIMEOUT_MS,
-          label: '摘要生成',
         });
-        let text;
-        try {
-          // 推理模型会先把预算花在思考上，1200 不够；给到 2400
-          text = await askOnce(2_400);
-        } catch (error) {
-          // 输出仍被截断：退回「只写两句、别铺开」的紧凑要求再试一次
-          if (!/maxTokens|截断/.test(messageOf(error))) throw error;
-          const compact = Object.assign({}, item, {
-            body: body ? truncate(body, 900) : '',
-            compact: true,
-          });
-          const retry = buildSummaryPrompt(compact);
-          text = await callModel({
-            route,
-            system: retry.system,
-            prompt: retry.prompt,
-            maxTokens: 900,
-            temperature: 0.3,
-            timeoutMs: SUMMARY_TIMEOUT_MS,
-            label: '摘要生成（紧凑重试）',
-          });
+        if (text === null) {
+          skipped += 1;
+          return;
         }
         const summary = sanitizeSummary(text);
         if (!summary) throw new Error('模型返回了空摘要');
+        if (!useAbstract && !body) noBody += 1;
         item.summary = summary;
         summarized += 1;
-        cacheDirty = true;
-        if (key) cache.entries[key] = { summary, at: clock().getTime() };
+        if (key) {
+          cache.entries[key] = { summary, at: clock().getTime() };
+          cacheDirty = true;
+        }
       } catch (error) {
         item.summary = '';
         errors.push(`「${truncate(item.title, 40)}」摘要生成失败：${messageOf(error)}`);
       }
     });
 
+    if (noModel > 0) errors.push(`模型不可用，${noModel} 条没有生成逐条中文总结（条目只有标题与源摘要可用）`);
     if (skipped > 0) errors.push(`整体生成超过时间预算，${skipped} 条保留项未生成摘要`);
     if (noBody > 0) {
       errors.push(`${noBody} 条没有抓到正文（只按标题与源摘要生成），这些摘要细节会偏少`);
@@ -3320,8 +3337,30 @@ export function createRuntime(options = {}) {
     return summarized;
   }
 
+  async function readRecentItemKeys(start, days) {
+    const seenIds = new Set();
+    const seenTitles = new Set();
+    const dates = Array.from({ length: days }, (_, i) => {
+      const past = new Date(start);
+      past.setDate(past.getDate() - i - 1);
+      return localDateString(past);
+    });
+    await mapPool(dates, FETCH_CONCURRENCY, async (date) => {
+      const digest = await readDigest(date);
+      for (const item of digest?.items ?? []) {
+        if (!isPlainObject(item)) continue;
+        if (item.id) seenIds.add(item.id);
+        const titleKey = normalizeTitleForDedup(item.title, item.source);
+        if (titleKey) seenTitles.add(titleKey);
+      }
+    });
+    return { seenIds, seenTitles };
+  }
+
   async function buildDigest() {
-    const deadline = clock().getTime() + GENERATION_BUDGET_MS;
+    const start = clock();
+    const date = localDateString(start);
+    const deadline = start.getTime() + GENERATION_BUDGET_MS;
     const config = await loadConfig();
     if (!config.enabled) throw new Error('插件已停用（config.enabled = false），未生成简报');
 
@@ -3345,70 +3384,54 @@ export function createRuntime(options = {}) {
         .filter((source) => Number.isInteger(source.maxItems) && source.maxItems > 0)
         .map((source) => [source.id, source.maxItems]),
     );
-    let prepared = prepareCandidates(
-      results.flatMap((entry) => entry.items),
-      config.maxCandidates,
-      { sourceLimits },
-    );
-
-    // 时效过滤：过旧的条目不该出现在"今天"的简报里（实测有 2025 年的老帖混进来过）
-    const fresh = filterFreshness(prepared.items, {
-      nowMs: clock().getTime(),
-      maxAgeDays: Number.isFinite(config.maxAgeDays) ? config.maxAgeDays : 3,
+    const rawItems = results.flatMap((entry) => entry.items);
+    if (!rawItems.length) {
+      const detail = failed.length
+        ? `${failed.length}/${enabledSources.length} 个源失败，第一个错误：${failed[0].error}`
+        : `${enabledSources.length} 个源都合法返回了 0 条`;
+      throw new Error(`没有抓到任何可用条目：${detail}`);
+    }
+    const fresh = filterFreshness(rawItems, {
+      nowMs: start.getTime(),
+      maxAgeDays: config.maxAgeDays,
     });
     if (fresh.dropped.length > 0) {
       errors.push(`丢弃 ${fresh.dropped.length} 条过期条目（发布超过 ${config.maxAgeDays} 天）`);
     }
 
-    // 跨天去重：最近 N 天推过的条目不再重复推（否则同一条新闻连着一周出现，旧投票也会一直挂着）
-    const repeatDays = Number.isFinite(config.repeatWindowDays) ? config.repeatWindowDays : 7;
-    let repeated = { items: fresh.items, dropped: [] };
-    if (repeatDays > 0 && fresh.items.length > 0) {
-      const seenIds = new Set();
-      const seenTitles = new Set();
-      for (let back = 1; back <= repeatDays; back += 1) {
-        const past = new Date(clock().getTime() - back * 24 * 60 * 60 * 1000);
-        const key = `${past.getFullYear()}-${String(past.getMonth() + 1).padStart(2, '0')}-${String(past.getDate()).padStart(2, '0')}`;
-        const digest = await readDigest(key);
-        if (!digest || !Array.isArray(digest.items)) continue;
-        for (const item of digest.items) {
-          if (item.id) seenIds.add(item.id);
-          const titleKey = normalizeTitleForDedup(item.title, item.source);
-          if (titleKey) seenTitles.add(titleKey);
-        }
-      }
-      repeated = filterRepeats(fresh.items, { seenIds, seenTitles });
-      if (repeated.dropped.length > 0) {
-        errors.push(`跳过 ${repeated.dropped.length} 条最近 ${repeatDays} 天已经推过的条目`);
-      }
+    const recent = fresh.items.length && config.repeatWindowDays
+      ? await readRecentItemKeys(start, config.repeatWindowDays)
+      : {};
+    const prepared = prepareCandidates(fresh.items, config.maxCandidates, { ...recent, sourceLimits });
+    if (prepared.repeated > 0) {
+      errors.push(`跳过 ${prepared.repeated} 条最近 ${config.repeatWindowDays} 天已经推过的条目`);
     }
-    prepared = { ...prepared, items: repeated.items };
-
-    if (prepared.total > prepared.items.length) {
+    if (prepared.truncated > 0) {
       errors.push(
-        `去重后共 ${prepared.total} 条候选，只把最新 ${prepared.items.length} 条交给模型（maxCandidates=${config.maxCandidates}）`,
+        `按信息源配额和候选上限选中 ${prepared.items.length} 条，另有 ${prepared.truncated} 条超过配额（maxCandidates=${config.maxCandidates}）`,
       );
     }
-    if (prepared.items.length === 0) {
-      const allOkEmpty = failed.length === 0;
-      const detail = allOkEmpty
-        ? `${enabledSources.length} 个源都合法返回了 0 条（今天可能确实没有更新，或者源的地址已失效）`
-        : `${failed.length}/${enabledSources.length} 个源失败，第一个错误：${failed[0].error}`;
-      throw new Error(`没有抓到任何可用条目：${detail}`);
+    if (fresh.items.length && !prepared.total) {
+      throw new Error('抓到的条目均缺少可用的标题或链接');
     }
-    if (!config.interests.trim()) {
+    if (!prepared.items.length && failed.length) {
+      throw new Error(`成功抓取的源没有符合条件的新条目，另有 ${failed.length} 个源失败：${failed[0].error}`);
+    }
+    if (prepared.items.length && !config.interests.trim()) {
       errors.push('兴趣描述为空：模型缺少判断依据，建议在设置里补充你的关注点');
     }
 
-    const route = await routeFor(config);
+    const selectedRoute = prepared.items.length ? await routeFor(config) : null;
+    const route = selectedRoute && typeof llmService()?.stream === 'function' ? selectedRoute : null;
     let filterMode = 'llm';
     let judgement = null;
 
-    if (!route) {
+    if (!prepared.items.length) {
+      filterMode = 'no-candidates';
+    } else if (!route) {
       filterMode = 'fallback';
-      errors.push(
-        '没有解析到可用的模型（config.model 为空，宿主的 agentDefaultModel / settings 也取不到），本次未做模型筛选：按发布时间倒序保留全部候选',
-      );
+      const cause = selectedRoute ? '宿主没有可用的 llm.stream 服务' : '没有解析到可用的模型（配置和宿主均未提供默认模型）';
+      errors.push(`${cause}，本次未做模型筛选：按发布时间倒序保留全部候选`);
     } else {
       try {
         judgement = await filterWithModel(route, config, prepared.items, errors);
@@ -3445,18 +3468,27 @@ export function createRuntime(options = {}) {
 
     // 兜底去重：模型失败（fallback）时尤其重要，否则聚合源 + 原始源会各留一条
     const collapsed = collapseDuplicates(kept);
+    kept = collapsed.kept;
     if (collapsed.dropped.length > 0) {
       errors.push(`自动合并了 ${collapsed.dropped.length} 条重复事件（同一件事被多个源报道）`);
-      dropped = dropped.concat(collapsed.dropped);
-      kept = collapsed.kept;
     }
 
     // 探索配额：每天故意留几个位置给「按当前口味会被滤掉」的条目，
     // 否则品味越学越窄，最后只剩同一类东西。
     const maxItems = Number.isInteger(config.maxItems) && config.maxItems > 0 ? config.maxItems : 25;
     const ratio = Number.isFinite(config.exploreRatio) ? Math.min(0.5, Math.max(0, config.exploreRatio)) : 0.2;
-    const exploreCount = Math.max(0, Math.round(maxItems * ratio));
-    const selection = selectTopItems(kept, Math.max(1, maxItems - exploreCount));
+    const exploreCount = Math.min(Math.round(maxItems * ratio), kept.length ? maxItems - 1 : maxItems);
+    // 只从模型明确丢弃的条目里探索。按实际选出数留位，剩余名额交还给常规保留项。
+    const explorePicked = await pickExplorationItems(
+      dropped, exploreCount, kept, `${date}|${config.interests.slice(0, 40)}`, route, errors,
+    );
+    if (explorePicked.length) {
+      const exploreIds = new Set(explorePicked.map((item) => item.id));
+      dropped = dropped.filter((item) => !exploreIds.has(item.id));
+      errors.push(`今天留了 ${explorePicked.length} 个探索位（跨出你常看的类型），喜欢就点个赞，它会进入品味档案`);
+    }
+    dropped = dropped.concat(collapsed.dropped);
+    const selection = selectTopItems(kept, maxItems - explorePicked.length);
     for (const item of selection.truncated) {
       dropped.push({
         ...item,
@@ -3469,25 +3501,9 @@ export function createRuntime(options = {}) {
       );
     }
 
-    let explorePicked = [];
-    if (exploreCount > 0) {
-      const pool = dropped.filter((entry) => entry && entry.id && entry.url);
-      configureExplorationHints({
-        keptSources: [...new Set(selection.items.map((item) => item.source))],
-        keptCategories: [...new Set(selection.items.map((item) => item.category))],
-      });
-      explorePicked = (await pickExplorationItems(pool, exploreCount, config, route, errors))
-        .map((item) => ({ ...item, summary: '' }));
-      if (explorePicked.length > 0) {
-        const exploreIds = new Set(explorePicked.map((item) => item.id));
-        dropped = dropped.filter((entry) => !exploreIds.has(entry.id));
-        errors.push(`今天留了 ${explorePicked.length} 个探索位（跨出你常看的类型），喜欢就点个赞，它会进入品味档案`);
-      }
-    }
-
     const items = sortForDisplay(selection.items)
-      .map((item) => ({ ...item, summary: '' }))
-      .concat(explorePicked);
+      .concat(explorePicked)
+      .map((item) => ({ ...item, summary: '' }));
     if (items.length === 0 && dropped.length > 0) {
       errors.push(
         `模型判断今天没有值得保留的条目（${dropped.length} 条全部被滤掉）；如果这不符合预期，可以检查兴趣描述，或点「重新生成」再试一次`,
@@ -3499,7 +3515,7 @@ export function createRuntime(options = {}) {
     }
 
     const digest = {
-      date: today(),
+      date,
       generatedAt: clock().toISOString(),
       items: items.map(toDigestItem),
       dropped: dropped
@@ -3558,7 +3574,7 @@ export function createRuntime(options = {}) {
         log.warn(`prompt 刷新失败（简报已写入）：${messageOf(error)}`);
       }
       log.info(
-        `已生成 ${digest.date} 简报：抓取 ${digest.totals.fetched}，保留 ${digest.items.length}，滤掉 ${digest.totals.dropped}`,
+        `已生成 ${digest.date} 简报：候选 ${digest.totals.fetched}，保留 ${digest.items.length}，滤掉 ${digest.totals.dropped}`,
       );
       return { ok: true, digest };
     } catch (error) {
@@ -3638,7 +3654,11 @@ export function createRuntime(options = {}) {
     };
   }
 
-  async function handleState() {
+  async function handleState(request) {
+    const url = new URL(request?.url ?? ROUTE_PATHS.state, 'http://localhost');
+    if (url.searchParams.get('view') === 'status') {
+      return { body: { ok: true, running, lastError } };
+    }
     const config = await loadConfig();
     const date = today();
     const digest = await readDigest(date);
@@ -3671,9 +3691,14 @@ export function createRuntime(options = {}) {
     };
   }
 
-  async function handleRefresh() {
-    const result = await generate({ trigger: 'manual' });
-    if (result.busy) return { body: { ok: true, busy: true } };
+  async function handleRefresh(request) {
+    if (running) return { body: { ok: true, busy: true } };
+    const work = generate({ trigger: 'manual' });
+    const prefer = String(request?.headers?.prefer ?? '').toLowerCase().split(',');
+    if (prefer.some((value) => value.trim() === 'respond-async')) {
+      return { status: 202, body: { ok: true, running: true } };
+    }
+    const result = await work;
     if (!result.ok) return { body: { ok: false, error: result.error } };
     return { body: { ok: true, digest: result.digest } };
   }
@@ -3810,8 +3835,8 @@ export function createRuntime(options = {}) {
 // ---------------------------------------------------------------------------
 
 const ROUTE_DEFS = [
-  { method: 'GET', path: ROUTE_PATHS.state, run: (runtime) => runtime.handleState() },
-  { method: 'POST', path: ROUTE_PATHS.refresh, run: (runtime) => runtime.handleRefresh() },
+  { method: 'GET', path: ROUTE_PATHS.state, run: (runtime, request) => runtime.handleState(request) },
+  { method: 'POST', path: ROUTE_PATHS.refresh, run: (runtime, request) => runtime.handleRefresh(request) },
   { method: 'POST', path: ROUTE_PATHS.config, run: (runtime, request) => runtime.handleConfigSave(request) },
   { method: 'POST', path: ROUTE_PATHS.sourceTest, run: (runtime, request) => runtime.handleSourceTest(request) },
   { method: 'GET', path: ROUTE_PATHS.digest, run: (runtime, request) => runtime.handleDigestQuery(request) },

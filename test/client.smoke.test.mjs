@@ -59,13 +59,13 @@ const state = {
   digest,
 }
 
-function loadModule() {
+function loadModule(respond = (url) => url.includes('/state') || url.includes('/digest') ? state : { ok: true }) {
   const React = makeReact()
   const store = {}
   globalThis.window = { __ModuleLoader__: { load: (entry) => { globalThis.__entry = entry } } }
   Object.defineProperty(globalThis, 'navigator', { value: { clipboard: { writeText: async () => {} } }, configurable: true })
-  const fakeFetch = async (url) => {
-    const body = String(url).includes('/state') || String(url).includes('/digest') ? state : { ok: true }
+  const fakeFetch = async (url, init) => {
+    const body = await respond(String(url), init)
     return {
       ok: true,
       status: 200,
@@ -89,6 +89,45 @@ function loadModule() {
 test('客户端：三个槽位都能注册', () => {
   const { store } = loadModule()
   assert.deepEqual(Object.keys(store).sort(), ['main', 'settings.section', 'sidebar.panellist'])
+})
+
+test('客户端：重新生成后显示进行中，轮询结束后读取当天结果', async (t) => {
+  const requests = []
+  let finished = false
+  const today = new Date()
+  const date = [today.getFullYear(), String(today.getMonth() + 1).padStart(2, '0'), String(today.getDate()).padStart(2, '0')].join('-')
+  const { React, store } = loadModule((url, init) => {
+    requests.push({ url, init })
+    if (url.endsWith('/refresh')) return { ok: true, running: true }
+    if (url.endsWith('?view=status')) {
+      finished = true
+      return { ok: true, running: false, lastError: null }
+    }
+    return { ...state, digest: finished ? { ...digest, date, items: [], filterMode: 'no-candidates' } : null }
+  })
+  function button(node, label) {
+    if (node?.type === 'button' && node.children.includes(label)) return node
+    for (const child of node?.children ?? []) {
+      const found = button(child, label)
+      if (found) return found
+    }
+  }
+  const render = () => { React.__begin(); return store.main.comp({}) }
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  render()
+  React.__runEffects()
+  await new Promise(setImmediate)
+  await button(render(), '重新生成').props.onClick()
+  assert.equal(requests.find((r) => r.url.endsWith('/refresh')).init.headers.Prefer, 'respond-async')
+  assert.equal(button(render(), '生成中…').props.disabled, true)
+  React.__runEffects()
+  await new Promise(setImmediate)
+  t.mock.timers.tick(5000)
+  await new Promise(setImmediate)
+  assert.deepEqual(requests.slice(-2).map((r) => r.url), ['/api/dsh-news/state?view=status', '/api/dsh-news/state'])
+  const result = render()
+  assert.equal(button(result, '重新生成').props.disabled, false)
+  assert.match(JSON.stringify(result), /今天没有符合条件的新条目/)
 })
 
 test('客户端：每个组件都能渲染，不引用作用域外变量', async () => {

@@ -67,6 +67,12 @@ function makeFeed(count, prefix = 'https://many.example/posts') {
   return `<?xml version="1.0"?><rss version="2.0"><channel><title>Many</title>${items}</channel></rss>`;
 }
 
+function rssWithItems(items) {
+  return '<rss><channel>' + items.map(({ title, url, excerpt = '', publishedAt = '' }) =>
+    `<item><title><![CDATA[${title}]]></title><link>${url}</link><description><![CDATA[${excerpt}]]></description><pubDate>${publishedAt}</pubDate></item>`,
+  ).join('') + '</channel></rss>';
+}
+
 const ANTHROPIC_HTML = `<!DOCTYPE html><html lang="en"><body>
   <article class="tile-a">
     <header><p><a class="cat" href="/news/announcements">Announcements</a></p><time>Oct 18, 2026</time></header>
@@ -1220,6 +1226,102 @@ test('pruneSummaryCache: 过期丢弃、按写入时间保留最新 500 条', ()
 // 运行时集成（假 curl + 假 llm）
 // ---------------------------------------------------------------------------
 
+test('generate: 已推条目和旧转载不会挤占今天的单源及全局候选配额', async (t) => {
+  const source = { ...smallConfig().sources[0], maxItems: 5 };
+  const stories = Array.from({ length: 8 }, (_, i) => ({
+    title: `模型发布 ${i}`, url: `https://a.example/model/${i}`,
+    publishedAt: new Date(NOW.getTime() - i * 60_000).toISOString(),
+  }));
+  const oldCopy = { ...stories[5], publishedAt: '2025-11-03T00:00:00Z' };
+  const llm = makeLlm({ filter: (prompt) => filterJson(prompt, () => true) });
+  const { runtime, root } = await makeRuntime(t, {
+    services: { llm }, execCurl: makeCurl({ [source.url]: rssWithItems([oldCopy, ...stories]) }),
+    config: smallConfig({ sources: [source], maxCandidates: 5, maxAgeDays: 2, repeatWindowDays: 1 }),
+  });
+  const previous = stories.slice(0, 5).map(({ title }) => ({ title: title + ' - 爱范儿' }));
+  await fsp.mkdir(runtime.digestDir);
+  await fsp.writeFile(path.join(root, 'digest', '2026-11-02.json'), JSON.stringify({ items: previous }));
+  const { ok, digest, error } = await runtime.generate();
+  assert.equal(ok, true, error);
+  assert.deepEqual(digest.items.map((item) => item.title).sort(), stories.slice(5).map((item) => item.title));
+  assert.equal(digest.sources[0].count, 9);
+  assert.equal(digest.totals.fetched, 3);
+  assert.ok(digest.errors.some((line) => line.includes('5 条最近')));
+  assert.ok(digest.errors.some((line) => line.includes('1 条过期')));
+  assert.equal(llm.filterCalls().length, 1);
+});
+
+test('prepareCandidates: 标点和媒体后缀可合并，不同版本在今天和跨天都保留', () => {
+  const rows = ['Model 1.10 发布 - 36氪', 'Model 11.0 发布', 'Model 1.10 发布！'].map((title, i) => ({
+    title, url: `https://a.example/${i}`, source: 'Feed A',
+  }));
+  const sameDay = news.prepareCandidates(rows);
+  assert.deepEqual(sameDay.items.map((item) => item.title), rows.slice(0, 2).map((item) => item.title));
+  const seenTitles = new Set([news.normalizeTitleForDedup(rows[0].title, rows[0].source)]);
+  const nextDay = news.prepareCandidates(rows, 80, { seenTitles });
+  assert.deepEqual(nextDay.items.map((item) => item.title), [rows[1].title]);
+});
+
+test('去重保留原始报道，即使聚合稿先到或摘录更长', () => {
+  const original = { title: 'An open model simplifies neural training on mobile devices', url: 'https://a.example/post' };
+  const aggregate = { ...original, url: 'https://news.google.com/rss/articles/report', sourceType: 'google-news', excerpt: '聚合摘录'.repeat(40) };
+  assert.deepEqual(news.prepareCandidates([aggregate, original]).items.map((item) => item.url), [original.url]);
+  const near = { ...aggregate, title: aggregate.title + ' now' };
+  for (const order of [[original, near], [near, original]]) {
+    assert.deepEqual(news.collapseDuplicates(order).kept.map((item) => item.url), [original.url]);
+  }
+});
+
+test('generate: 所有抓到的稿件均过期时记录无新候选，后续 tick 不再抓取', async (t) => {
+  const llm = makeLlm();
+  const source = smallConfig().sources[0];
+  const execCurl = makeCurl({ [source.url]: RSS_A });
+  const { runtime } = await makeRuntime(t, {
+    services: { llm }, execCurl, config: smallConfig({ sources: [source], maxAgeDays: 1 }),
+  });
+  const { ok, digest, error } = await runtime.generate();
+  assert.equal(ok, true, error);
+  assert.equal(digest.filterMode, 'no-candidates');
+  assert.match(digest.markdown, /没有符合时效和去重条件的新条目/);
+  assert.equal(digest.sources[0].count, 2);
+  assert.equal((await runtime.tick()).skipped, 'exists');
+  assert.equal(execCurl.calls.length, 1);
+  assert.equal(llm.calls.length, 0);
+});
+
+test('generate: 部分源失败、其余稿件已过期时保留重试机会', async (t) => {
+  const [a, b] = smallConfig().sources;
+  const { runtime } = await makeRuntime(t, {
+    execCurl: makeCurl({ [a.url]: RSS_A }), config: smallConfig({ sources: [a, b], maxAgeDays: 1 }),
+  });
+  const result = await runtime.generate();
+  assert.equal(result.ok, false);
+  assert.match(result.error, /1 个源失败/);
+  assert.equal(await runtime.hasDigest(TODAY), false);
+});
+
+test('generate: 跨过午夜时仍保存到开始生成的日期，并按本地日历查昨天', async (t) => {
+  let now = new Date(2026, 2, 9, 0, 15);
+  const source = smallConfig().sources[0];
+  const llm = makeLlm();
+  const { runtime } = await makeRuntime(t, {
+    now: () => new Date(now), services: { llm },
+    execCurl: makeCurl({ [source.url]: () => {
+      now = new Date(2026, 2, 10, 0, 1);
+      return { ok: true, status: 200, body: RSS_A };
+    } }),
+    config: smallConfig({ sources: [source], repeatWindowDays: 1 }),
+  });
+  await fsp.mkdir(runtime.digestDir);
+  await fsp.writeFile(path.join(runtime.digestDir, '2026-03-08.json'), JSON.stringify({ items: news.parseFeed(RSS_A) }));
+  const result = await runtime.generate();
+  assert.equal(result.ok, true, result.error);
+  assert.equal(result.digest.date, '2026-03-09');
+  assert.equal(result.digest.filterMode, 'no-candidates');
+  assert.equal(await runtime.hasDigest('2026-03-10'), false);
+  assert.equal(llm.calls.length, 0);
+});
+
 test('generate: 三源（含一个失败）→ 模型筛选 + 逐条摘要 + 落盘 JSON/MD + 缓存复用', async (t) => {
   const llm = makeLlm();
   const execCurl = defaultCurl();
@@ -1313,6 +1415,16 @@ test('generate: 模型不可用 → filterMode=fallback，按时间保留并在 
   assert.equal(llm.calls.length, 0, '模型路由不可用就不该调用 llm');
 });
 
+test('generate: 已指定模型但宿主无模型服务时只抓 feed', async (t) => {
+  const source = smallConfig().sources[0];
+  const execCurl = makeCurl({ [source.url]: RSS_A });
+  const { runtime } = await makeRuntime(t, { execCurl, config: smallConfig({ sources: [source] }) });
+  const result = await runtime.generate();
+  assert.equal(result.digest.filterMode, 'fallback');
+  assert.equal(result.digest.totals.summarized, 0);
+  assert.deepEqual(execCurl.calls.map((call) => call.url), [source.url]);
+});
+
 test('generate: 模型调用失败 → fallback + 如实记录原因', async (t) => {
   const llm = {
     calls: [],
@@ -1347,7 +1459,7 @@ test('generate: 模型返回非 JSON → fallback，并保留全部候选', asyn
   assert.equal(result.digest.items.length, 4);
 });
 
-test('generate: max-tokens 截断 → 用一半候选重试一次并在 errors 说明', async (t) => {
+test('generate: 输出截断后分两批重试，后半批的判断对应原条目', async (t) => {
   let filterCalls = 0;
   const llm = makeLlm({
     filter: (prompt) => {
@@ -1355,7 +1467,7 @@ test('generate: max-tokens 截断 → 用一半候选重试一次并在 errors �
       if (filterCalls === 1) {
         return { __chunks: [{ type: 'text-delta', text: '输出到一半' }, { type: 'finish', reason: { kind: 'max-tokens' } }] };
       }
-      return filterJson(prompt, () => true);
+      return filterJson(prompt, (i) => i === 1 || i === 7);
     },
   });
   const execCurl = makeCurl({ 'https://many.example/rss': makeFeed(15) });
@@ -1370,9 +1482,25 @@ test('generate: max-tokens 截断 → 用一半候选重试一次并在 errors �
   const result = await runtime.generate();
   assert.equal(result.ok, true, result.error);
   assert.equal(result.digest.filterMode, 'llm');
-  assert.equal(result.digest.items.length, 15);
+  assert.equal(filterCalls, 3);
+  assert.deepEqual(result.digest.items.map((item) => item.title).sort(), [1, 7, 9, 15].map((n) => `Story ${n} about AI`).sort());
+  assert.equal(result.digest.totals.dropped, 11);
   assert.ok(result.digest.errors.some((line) => /maxTokens/.test(line) && /重试一次/.test(line)));
-  assert.ok(result.digest.errors.some((line) => /只判断了 8\/15/.test(line)));
+});
+
+test('generate: 第二批仍无法解析时保留该批，第一批的有效判断照常使用', async (t) => {
+  const llm = makeLlm({ filter: (prompt) => prompt.includes('共 8 条') ? filterJson(prompt, () => false) : '缺少判断' });
+  const source = smallConfig().sources[0];
+  const { runtime } = await makeRuntime(t, {
+    services: { llm }, config: smallConfig({ sources: [source] }),
+    execCurl: makeCurl({ [source.url]: makeFeed(15) }),
+  });
+  const result = await runtime.generate();
+  assert.equal(result.ok, true, result.error);
+  assert.equal(result.digest.items.length, 7);
+  assert.ok(result.digest.items.every((item) => item.reason.includes('未给出判断')));
+  assert.equal(result.digest.dropped.length, 8);
+  assert.ok(result.digest.errors.some((line) => line.includes('只判断了 8/15')));
 });
 
 test('generate: 探索位从被滤掉的条目里补几条，并带 explore 标记', async (t) => {
@@ -1395,6 +1523,167 @@ test('generate: 探索位从被滤掉的条目里补几条，并带 explore 标�
   assert.ok(result.digest.items.length <= 6, '探索位不能突破每日上限')
   assert.ok(result.digest.errors.some((line) => /探索位/.test(line)))
 })
+
+test('generate: 探索池排除重复报道，剩余名额补给模型保留项', async (t) => {
+  const source = smallConfig().sources[0];
+  const titles = [
+    'Open weights simplify training large language models on mobile devices',
+    'Open weights simplify training large language models on mobile devices today',
+    'Open weights simplify training large language models on mobile devices now',
+    'AI 编译器发布', 'AI 芯片量产', '多模态基准开放', 'AI 机器人研究',
+  ];
+  const llm = makeLlm({ filter: (prompt) => {
+    if (prompt.includes('【今天的候选条目】')) return filterJson(prompt, (i) => i !== 3 && i !== 7);
+    return '[{"i":1}]';
+  } });
+  const execCurl = makeCurl({ [source.url]: rssWithItems(titles.map((title, i) => ({ title, url: `https://a.example/${i}` }))) });
+  const { runtime } = await makeRuntime(t, {
+    services: { llm }, execCurl, config: smallConfig({ sources: [source], maxItems: 4, exploreRatio: 0.5 }),
+  });
+  const { ok, digest, error } = await runtime.generate();
+  assert.equal(ok, true, error);
+  assert.equal(digest.items.length, 4);
+  assert.deepEqual(digest.items.filter((item) => item.explore).map((item) => item.title), [titles[6]]);
+  assert.equal(digest.items.filter((item) => item.title.includes('mobile devices')).length, 1);
+  assert.equal(digest.totals.kept + digest.totals.dropped, digest.totals.fetched);
+  const exploreCall = llm.calls.find((call) => call.system.includes('挑「探索位」'));
+  assert.ok(exploreCall);
+  assert.doesNotMatch(exploreCall.messages[0].content[0].text, /mobile devices/);
+  await runtime.saveConfigPatch({ maxItems: 1 });
+  const second = await runtime.generate();
+  assert.equal(second.digest.items.length, 1);
+  assert.ok(!second.digest.items[0].explore);
+});
+
+test('generate: 全部通过模型筛选时用满名额，省去探索模型调用', async (t) => {
+  const source = smallConfig().sources[0];
+  const llm = makeLlm({ filter: (prompt) => filterJson(prompt, () => true) });
+  const { runtime } = await makeRuntime(t, {
+    services: { llm }, execCurl: makeCurl({ [source.url]: makeFeed(8) }),
+    config: smallConfig({ sources: [source], maxItems: 6, exploreRatio: 0.5 }),
+  });
+  const { digest } = await runtime.generate();
+  assert.equal(digest.items.length, 6);
+  assert.ok(digest.items.every((item) => !item.explore));
+  assert.equal(llm.filterCalls().length, 1);
+});
+
+test('generate: 并行准备正文，最多同时写三条摘要，一条失败后继续处理队列', async (t) => {
+  const source = smallConfig().sources[0];
+  const bodies = Promise.withResolvers();
+  const summaries = Promise.withResolvers();
+  let articleRequests = 0;
+  let activeModels = 0;
+  let peakModels = 0;
+  let summaryRequests = 0;
+  const ok = (body) => ({ ok: true, status: 200, body });
+  const execCurl = async (url) => {
+    if (url === source.url) return ok(makeFeed(8));
+    articleRequests += 1;
+    await bodies.promise;
+    return ok('<article><p>' + '原文段落。'.repeat(40) + '</p></article>');
+  };
+  const filter = makeLlm({ filter: (prompt) => filterJson(prompt, () => true) });
+  const llm = { stream(request) {
+    if (!request.system.startsWith('你是中文科技编辑')) return filter.stream(request);
+    return (async function* () {
+      const n = ++summaryRequests;
+      activeModels += 1;
+      peakModels = Math.max(peakModels, activeModels);
+      try {
+        await summaries.promise;
+        if (n === 1) throw new Error('单条摘要生成失败');
+        yield { type: 'text-delta', text: '模型摘要' };
+        yield { type: 'finish', reason: 'stop' };
+      } finally {
+        activeModels -= 1;
+      }
+    })();
+  } };
+  const { runtime } = await makeRuntime(t, {
+    services: { llm }, execCurl, config: smallConfig({ sources: [source] }),
+  });
+  const work = runtime.generate();
+  try {
+    await t.waitFor(() => assert.equal(articleRequests, 6), { interval: 5 });
+    bodies.resolve();
+    await t.waitFor(() => assert.equal(activeModels, 3), { interval: 5 });
+    assert.equal(articleRequests, 6);
+  } finally {
+    bodies.resolve();
+    summaries.resolve();
+    await work;
+  }
+  const { digest } = await work;
+  assert.equal(peakModels, 3);
+  assert.equal(summaryRequests, 8);
+  assert.equal(digest.totals.summarized, 7);
+  assert.ok(digest.errors.some((line) => line.includes('单条摘要生成失败')));
+});
+
+test('generate: arXiv 长摘要直接使用，直连成功不探测代理，模型离线仍可复用摘要缓存', async (t) => {
+  const source = smallConfig().sources[0];
+  const paper = { title: '论文', url: 'https://arxiv.org/abs/1234.56789', excerpt: '语言模型评测结果。'.repeat(30) };
+  const article = { title: '行业新闻', url: 'https://a.example/article' };
+  const execCurl = makeCurl({
+    [source.url]: rssWithItems([paper, article]),
+    [article.url]: '<article><p>' + '直连可以读到正文。'.repeat(30) + '</p></article>',
+  });
+  let probes = 0;
+  const llm = makeLlm();
+  const { runtime } = await makeRuntime(t, {
+    services: { llm }, execCurl, config: smallConfig({ sources: [source] }),
+    probeProxy: async () => { probes += 1; return null; },
+  });
+  const first = await runtime.generate();
+  assert.equal(first.ok, true, first.error);
+  assert.deepEqual(execCurl.calls.map((call) => call.url), [source.url, article.url]);
+  assert.equal(probes, 0);
+  assert.ok(!first.digest.errors.some((line) => line.includes('没有抓到正文')));
+  const prompts = llm.summaryCalls().map((call) => call.messages[0].content[0].text);
+  assert.ok(prompts.some((prompt) => prompt.includes(paper.excerpt)));
+  assert.ok(prompts.some((prompt) => prompt.includes('直连可以读到正文')));
+
+  await runtime.saveConfigPatch({ model: { provider: '', model: '' } });
+  const second = await runtime.generate();
+  assert.equal(second.digest.filterMode, 'fallback');
+  assert.equal(second.digest.totals.summarized, 2);
+  assert.deepEqual(execCurl.calls.map((call) => call.url), [source.url, article.url, source.url]);
+  assert.equal(llm.summaryCalls().length, 2);
+});
+
+test('generate: 模型不响应取消时筛选仍能超时结束并释放生成锁', async (t) => {
+  const source = smallConfig().sources[0];
+  const started = Promise.withResolvers();
+  const stalled = Promise.withResolvers();
+  const working = makeLlm();
+  const llm = { stream(request) {
+    if (request.system.startsWith('你是中文科技编辑')) return working.stream(request);
+    return (async function* () {
+      started.resolve(request.signal);
+      await stalled.promise;
+      yield { type: 'finish', reason: 'stop' };
+    })();
+  } };
+  const { runtime } = await makeRuntime(t, {
+    services: { llm }, execCurl: makeCurl({ [source.url]: makeFeed(15) }),
+    config: smallConfig({ sources: [source], maxItems: 1 }),
+  });
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  try {
+    const work = runtime.generate();
+    const signal = await started.promise;
+    t.mock.timers.tick(120_001);
+    const result = await work;
+    assert.equal(signal.aborted, true);
+    assert.equal(result.digest.filterMode, 'fallback');
+    assert.match(result.digest.errors.join(' '), /模型筛选超时/);
+    assert.equal(runtime.isRunning(), false);
+  } finally {
+    stalled.resolve();
+    t.mock.timers.reset();
+  }
+});
 
 test('generate: 合法 0 条源（arXiv 场景）ok:true count:0，不写进 errors', async (t) => {
   const llm = makeLlm();
@@ -1799,6 +2088,35 @@ test('路由：refresh 生成中返回 busy；完成后返回 digest', async (t)
   const again = await callRoute(ctx, news.ROUTE_PATHS.refresh, { method: 'POST' });
   assert.equal(again.json.ok, true);
   assert.equal(again.json.digest.items.length, 2);
+});
+
+test('路由：后台刷新立即返回 202，轻量轮询可观察成功与失败，并发触发只生成一次', async (t) => {
+  const source = smallConfig().sources[0];
+  let feed = Promise.withResolvers();
+  const execCurl = makeCurl({ [source.url]: () => feed.promise });
+  const { ctx, runtime } = await makeRuntime(t, {
+    services: { llm: makeLlm() }, execCurl, config: smallConfig({ sources: [source], proxy: 'direct' }),
+  });
+  news.registerRoutes(ctx, runtime);
+  const refresh = () => callRoute(ctx, news.ROUTE_PATHS.refresh, { method: 'POST', headers: { prefer: 'respond-async' } });
+  const status = () => callRoute(ctx, news.ROUTE_PATHS.state, { url: news.ROUTE_PATHS.state + '?view=status' });
+  const accepted = await refresh();
+  assert.equal(accepted.response.status, 202);
+  assert.deepEqual(accepted.json, { ok: true, running: true });
+  assert.deepEqual((await status()).json, { ok: true, running: true, lastError: null });
+  assert.equal((await refresh()).json.busy, true);
+  feed.resolve({ ok: true, status: 200, body: RSS_A });
+  await t.waitFor(() => assert.equal(runtime.isRunning(), false), { interval: 5 });
+  assert.deepEqual((await status()).json, { ok: true, running: false, lastError: null });
+  assert.equal(execCurl.calls.filter((call) => call.url === source.url).length, 1);
+  assert.equal((await runtime.readDigest(TODAY)).items.length, 2);
+
+  feed = Promise.withResolvers();
+  assert.equal((await refresh()).response.status, 202);
+  feed.resolve({ ok: false, status: 404, error: 'HTTP 404' });
+  await t.waitFor(() => assert.equal(runtime.isRunning(), false), { interval: 5 });
+  assert.match((await status()).json.lastError, /HTTP 404/);
+  assert.equal((await runtime.readDigest(TODAY)).items.length, 2);
 });
 
 test('路由：GET digest 支持 date 参数、缺省今天、坏日期 400', async (t) => {
