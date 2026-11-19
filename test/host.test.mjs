@@ -1652,6 +1652,43 @@ test('generate: arXiv 长摘要直接使用，直连成功不探测代理，模�
   assert.equal(llm.summaryCalls().length, 2);
 });
 
+test('generate: 正文直连失败后走代理，允许五次跳转，第六次跳转回退源摘要', async (t) => {
+  const source = smallConfig().sources[0];
+  const proxy = 'http://127.0.0.1:7890';
+  const stories = [5, 6].map((last) => ({
+    title: `跳转测试 ${last}`, url: `https://a.example/redirect/${last}/0`, excerpt: '来自订阅的简短说明。',
+  }));
+  const visits = [];
+  let probes = 0;
+  const body = '从文章最终地址读取的正文。'.repeat(20);
+  const execCurl = async (url, options) => {
+    if (url === source.url) return { ok: true, status: 200, body: rssWithItems(stories) };
+    visits.push({ url, ...options });
+    if (!options.proxy) return { ok: false, status: 403 };
+    const [, last, hop] = url.match(/\/redirect\/(\d+)\/(\d+)$/);
+    if (Number(hop) < Number(last)) return { ok: false, status: 302, redirect: String(Number(hop) + 1) };
+    return { ok: true, status: 200, body: '<article><p>' + body + '</p></article>' };
+  };
+  const llm = makeLlm();
+  const { runtime } = await makeRuntime(t, {
+    services: { llm }, execCurl, config: smallConfig({ sources: [source] }),
+    probeProxy: async () => { probes += 1; return proxy; },
+  });
+  const result = await runtime.generate();
+  assert.equal(result.ok, true, result.error);
+  assert.equal(probes, 1);
+  assert.ok(visits.every((call) => call.noRedirect && call.captureRedirect));
+  for (const last of [5, 6]) {
+    const attempts = visits.filter((call) => call.url.includes(`/redirect/${last}/`));
+    assert.deepEqual(attempts.map((call) => call.proxy), ['', ...Array(6).fill(proxy)]);
+    assert.deepEqual(attempts.map((call) => call.url.split('/').pop()), ['0', '0', '1', '2', '3', '4', '5']);
+  }
+  const prompts = llm.summaryCalls().map((call) => call.messages[0].content[0].text);
+  assert.match(prompts.find((prompt) => prompt.includes(stories[0].title)), /从文章最终地址读取的正文/);
+  assert.match(prompts.find((prompt) => prompt.includes(stories[1].title)), /源摘要：来自订阅/);
+  assert.ok(result.digest.errors.some((line) => line.startsWith('1 条没有抓到正文')));
+});
+
 test('generate: 模型不响应取消时筛选仍能超时结束并释放生成锁', async (t) => {
   const source = smallConfig().sources[0];
   const started = Promise.withResolvers();
