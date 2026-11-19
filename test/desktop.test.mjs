@@ -1,8 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { execFileSync, spawn } from 'node:child_process';
+import { once } from 'node:events';
 import * as fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { createRuntime, digestId, localDateString, parseFeed, summaryCacheKey } from '../index.js';
 import { runCommand } from '../desktop/skills/daily-ai-news/scripts/news.mjs';
 
@@ -22,7 +25,7 @@ const xml = '<rss><channel>' + [
 
 const writeJSON = (file, value) => fs.writeFile(file, JSON.stringify(value));
 
-async function setup(t, config = {}) {
+async function setup(t, config = {}, readRelease = () => '<article><p>' + article + '</p></article>') {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'desktop-news-'));
   t.after(() => fs.rm(root, { recursive: true, force: true }));
   await writeJSON(path.join(root, 'config.json'), {
@@ -34,7 +37,7 @@ async function setup(t, config = {}) {
   const runtime = () => createRuntime({
     root, now: () => now, execCurl: async (url) => {
       calls.push(url);
-      const body = url === feed.url ? xml : url === release ? '<article><p>' + article + '</p></article>' : '';
+      const body = url === feed.url ? xml : url === release ? readRelease() : '';
       return { ok: Boolean(body), body, status: body ? 200 : 404, error: body ? '' : 'HTTP 404' };
     },
   });
@@ -117,6 +120,39 @@ test('桌面录入拒绝缺失、重复、越界或伪造的判断，允许修�
   await assert.rejects(env.cmd('read', '2026-02-30'), /日期/);
 });
 
+test('桌面刷新按来源重试摘录摘要，失败保留旧日报，完整材料归档后直接复用', async (t) => {
+  let full = false;
+  const env = await setup(t, {}, () => full ? '<article><p>' + article + '</p></article>' : '');
+  const decisions = [verdicts(2)[0], { ...verdicts(2)[1], keep: false }];
+  const first = await submit(env, await env.cmd('prepare'), decisions);
+  const [limited] = await materials(first);
+  assert.match(limited.prompt, /原文正文没抓到/);
+  await writeJSON(first.summaries, [{ id: limited.id, summary: '根据发布预告整理' }]);
+  await env.cmd('finish', first.selection);
+  assert.equal((await env.runtime().readDigest(day)).items[0].summaryBasis, 'excerpt');
+
+  const refresh = () => env.cmd('prepare', '--refresh').then((batch) => submit(env, batch, decisions));
+  assert.equal((await refresh()).status, 'ready');
+  const unchanged = await env.runtime().readDigest(day);
+  assert.equal(unchanged.items[0].summary, '根据发布预告整理');
+  assert.match(unchanged.errors.join(' '), /摘要生成时没有抓到正文/);
+  full = true;
+  const upgrade = await refresh();
+  const [evidence] = await materials(upgrade);
+  assert.match(evidence.prompt, /measured throughput/);
+  await writeJSON(upgrade.summaries, [{ id: evidence.id, summary: '' }]);
+  await assert.rejects(env.cmd('finish', upgrade.selection), /非空摘要/);
+  assert.deepEqual(await env.runtime().readDigest(day), unchanged);
+  await writeJSON(upgrade.summaries, [{ id: evidence.id, summary: '完整评测的摘要' }]);
+  await env.cmd('finish', upgrade.selection);
+  const recovered = await env.runtime().readDigest(day);
+  assert.equal(recovered.items[0].summaryBasis, undefined);
+  assert.equal(recovered.items[0].summary, '完整评测的摘要');
+  assert.doesNotMatch(recovered.errors.join(' '), /没有抓到正文/);
+  assert.equal((await refresh()).status, 'ready');
+  assert.equal(env.calls.filter((url) => url === release).length, 3);
+});
+
 test('桌面只为入选且未缓存的条目抓正文，落选理由可以回看', async (t) => {
   const env = await setup(t);
   const [known] = parseFeed(xml);
@@ -140,19 +176,22 @@ test('旧版 Harness Markdown、本地聊天期间出现的新归档及稍后的
   const dir = env.runtime().digestDir;
   await fs.mkdir(dir);
   const json = path.join(dir, day + '.json');
-  await writeJSON(json, { date: day, items: [] });
+  await writeJSON(json, { items: [] });
   await fs.writeFile(path.join(dir, day + '.md'), '旧版 Markdown');
   assert.equal(await env.cmd('read'), '旧版 Markdown');
-  assert.equal((await env.cmd('prepare')).status, 'ready');
+  const legacy = await env.cmd('prepare');
+  assert.equal(legacy.status, 'ready');
+  assert.equal(legacy.date, day);
   assert.equal(env.calls.length, 0);
   const first = await env.cmd('prepare', '--refresh');
   const other = await env.cmd('prepare', '--refresh');
   await submit(env, first, verdicts(2, false));
-  // 后提交的旧会话保留已经入档的结果。
-  const pending = await submit(env, other, verdicts(2));
-  await writeJSON(pending.summaries, (await materials(pending)).map(({ id }) => ({ id, summary: '旧会话摘要' })));
-  assert.equal((await env.cmd('finish', pending.selection)).totals.kept, 0);
-  assert.doesNotMatch(await env.cmd('read'), /旧会话摘要/);
+  const calls = env.calls.length;
+  const existing = await submit(env, other, verdicts(2));
+  assert.equal(existing.status, 'ready');
+  assert.equal(existing.superseded, true);
+  assert.equal(existing.totals.kept, 0);
+  assert.equal(env.calls.length, calls, '已被取代的筛选无需抓正文或让聊天写摘要');
   const newer = { date: day, generatedAt: new Date(+morning + 1000).toISOString(), items: [], markdown: '更新的 Harness 版本' };
   await writeJSON(json, newer);
   assert.equal(await env.cmd('read'), newer.markdown);
@@ -194,4 +233,142 @@ test('跨天去重覆盖两个入口当天分别保留的稿件', async (t) => {
   env.setDate(new Date(2026, 10, 20, 9));
   const empty = await env.cmd('prepare');
   assert.deepEqual(empty.totals, { fetched: 0, kept: 0, dropped: 0, summarized: 0 });
+});
+
+test('桌面 CLI 通过符号链接调用时与直接调用返回相同结果', async (t) => {
+  const env = await setup(t);
+  const alias = path.join(env.root, 'linked-scripts');
+  const scripts = fileURLToPath(new URL('../desktop/skills/daily-ai-news/scripts/', import.meta.url));
+  await fs.symlink(scripts, alias, process.platform === 'win32' ? 'junction' : 'dir');
+  const stdout = execFileSync(process.execPath, [path.join(alias, 'news.mjs'), 'interests'], {
+    cwd: env.root, env: { ...process.env, DSH_NEWS_HOME: env.root }, encoding: 'utf8',
+  });
+  assert.deepEqual(JSON.parse(stdout), await env.cmd('interests'));
+});
+
+test('保存兴趣遇到损坏的 JSON 或错误的顶层类型时保留原文件', async (t) => {
+  const env = await setup(t);
+  const runtime = env.runtime();
+  for (const raw of ['{"maxItems":14,}', '["手工配置"]']) {
+    await fs.writeFile(runtime.configFile, raw);
+    await assert.rejects(runCommand(['interests', '--stdin'], runtime, [Buffer.from('开源')]), /请先修复/);
+    assert.equal(await fs.readFile(runtime.configFile, 'utf8'), raw);
+  }
+});
+
+test('同一天两个聊天在同一毫秒完成时只提交一期，另一个读回获胜版本', async (t) => {
+  const env = await setup(t);
+  await env.runtime().desktop.save({ date: day, generatedAt: morning.toISOString(), items: [] });
+  const [a, b] = await Promise.all([env.cmd('prepare', '--refresh'), env.cmd('prepare', '--refresh')]);
+  const one = verdicts(2);
+  one[1].keep = false;
+  const choices = await Promise.all([submit(env, a, one), submit(env, b, verdicts(2))]);
+  await Promise.all(choices.map(async (c) => {
+    await writeJSON(c.summaries, (await materials(c)).map(({ id }) => ({ id, summary: '本轮摘要' })));
+  }));
+  const results = await Promise.all(choices.map((c) => env.cmd('finish', c.selection)));
+  assert.equal(results.filter((r) => r.superseded).length, 1);
+  const stored = await env.runtime().readDigest(day);
+  for (const result of results) assert.deepEqual(result.totals, stored.totals);
+});
+
+test('桌面与 Harness 在同一毫秒连续发布三次，各入口均读取最后提交的版本', async (t) => {
+  const env = await setup(t);
+  const rt = env.runtime();
+  await submit(env, await env.cmd('prepare'), verdicts(2, false));
+  const first = await rt.readDigest(day);
+  const waiting = await env.cmd('prepare', '--refresh');
+
+  const second = await rt.generate();
+  assert.equal(second.ok, true);
+  assert.equal(second.digest.items.length, 2);
+  assert.ok(second.digest.generatedAt > first.generatedAt);
+  assert.deepEqual(await rt.readDigest(day), second.digest);
+  assert.equal(await env.cmd('read'), second.digest.markdown);
+  assert.equal((await fs.readFile(path.join(rt.digestDir, day + '.md'), 'utf8')).trimEnd(), second.digest.markdown.trimEnd());
+  const calls = env.calls.length;
+  assert.equal((await submit(env, waiting, verdicts(2))).superseded, true);
+  assert.equal(env.calls.length, calls);
+
+  await submit(env, await env.cmd('prepare', '--refresh'), verdicts(2, false));
+  const third = await rt.readDigest(day);
+  assert.ok(third.generatedAt > second.digest.generatedAt);
+  assert.equal(third.items.length, 0);
+  const query = await rt.handleDigestQuery({ url: '/?date=' + day });
+  assert.deepEqual(query.body.digest, third);
+  assert.equal(await env.cmd('read'), third.markdown);
+});
+
+test('抓源、抓正文或等待摘要期间出现新归档时，直接返回已保存的版本', async (t) => {
+  const env = await setup(t);
+  const refreshDuringFetch = createRuntime({
+    root: env.root, now: () => morning,
+    execCurl: async (url) => {
+      const other = await env.runtime().generate();
+      assert.equal(other.ok, true);
+      return { ok: true, status: 200, body: url === feed.url ? xml : '<article><p>' + article + '</p></article>' };
+    },
+  });
+  const initial = await runCommand(['prepare'], refreshDuringFetch);
+  assert.equal(initial.status, 'ready');
+  assert.equal(initial.superseded, true);
+
+  const unfinished = await env.cmd('prepare', '--refresh');
+  const selection = await submit(env, unfinished, verdicts(2));
+  assert.equal(selection.status, 'summarize');
+  const reviewing = await env.cmd('prepare', '--refresh');
+  await writeJSON(reviewing.decisions, verdicts(2));
+  const result = await runCommand(['review', reviewing.run], refreshDuringFetch);
+  assert.equal(result.status, 'ready');
+  assert.equal(result.superseded, true);
+  // 旧聊天尚未写出 summaries.json，也应能接收新的归档。
+  assert.deepEqual(await env.cmd('finish', selection.selection), result);
+});
+
+test('配置首建与不同进程的修改可以并行，中断写入后能继续保存', { timeout: 12_000 }, async (t) => {
+  const env = await setup(t);
+  await fs.unlink(env.runtime().configFile);
+  await Promise.all([env.runtime().loadConfig(), env.runtime().saveConfigPatch({ maxItems: 9 })]);
+  assert.equal((await env.runtime().loadConfig()).maxItems, 9);
+
+  // 在子进程的原子提交点暂停，模拟用户关掉仍在保存的聊天。
+  const code = `
+    import { promises as fs } from 'node:fs';
+    const { createRuntime } = await import(process.argv[1]);
+    const runtime = createRuntime({ root: process.argv[2] });
+    const rename = fs.rename;
+    fs.rename = async (from, to) => {
+      if (to === runtime.configFile) {
+        process.send('writing');
+        await new Promise((resolve) => process.once('message', resolve));
+      }
+      return rename(from, to);
+    };
+    await runtime.saveConfigPatch({ maxItems: 99 });
+  `;
+  const child = spawn(process.execPath, ['--input-type=module', '-e', code,
+    new URL('../desktop/runtime.mjs', import.meta.url).href, env.root], { stdio: ['ignore', 'ignore', 'pipe', 'ipc'] });
+  const exited = once(child, 'exit');
+  const pending = [];
+  try {
+    const started = await Promise.race([once(child, 'message'), exited]);
+    assert.equal(started[0], 'writing');
+    pending.push(env.runtime().saveConfigPatch({ maxItems: 7 }));
+    pending.push(runCommand(['interests', '--stdin'], env.runtime(), [Buffer.from('新偏好')]));
+    const tickets = path.join(env.root, '.dsh-locks');
+    const end = Date.now() + 4_000;
+    while ((await fs.readdir(tickets)).filter((name) => /^config\.json\.\d+-[a-f0-9-]{36}$/.test(name)).length < 3) {
+      assert.ok(Date.now() < end, '两个请求应等待活跃写入');
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal((await env.runtime().loadConfig()).maxItems, 9);
+  } finally {
+    child.kill('SIGKILL');
+    await exited;
+    await Promise.all(pending);
+  }
+  const saved = await env.runtime().loadConfig();
+  assert.equal(saved.maxItems, 7);
+  assert.equal(saved.interests, '新偏好');
+  assert.deepEqual(await fs.readdir(path.join(env.root, '.dsh-locks')), []);
 });

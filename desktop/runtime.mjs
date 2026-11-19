@@ -31,7 +31,7 @@
  * 零依赖：只用 node: 内置模块；抓取一律走 execFile('curl', ...)。
  */
 
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { promises as fsp } from 'node:fs';
 import net from 'node:net';
@@ -45,7 +45,7 @@ import { fileURLToPath } from 'node:url';
 
 export const PACKAGE_ID = '@fffangchenghao/dsh-news';
 /** 代码版本：`/api/dsh-news/state` 会回传，用来判断宿主是否已加载新版。 */
-export const CODE_VERSION = '0.15.0';
+export const CODE_VERSION = '0.15.1';
 export const SECTION_NAME = 'plugin:dsh-news-digest';
 export const SECTION_ORDER = 160;
 
@@ -95,6 +95,7 @@ const FETCH_TIMEOUT_MS = 20_000;
 const ARTICLE_TIMEOUT_MS = 12_000;
 /** 喂给摘要的正文上限（字符）。 */
 const ARTICLE_MAX_CHARS = 2_600;
+const ARXIV_ABSTRACT_MAX_CHARS = 1_600;
 const FILTER_TIMEOUT_MS = 120_000;
 const SUMMARY_TIMEOUT_MS = 70_000;
 const GENERATION_BUDGET_MS = 9 * 60 * 1000;
@@ -105,6 +106,7 @@ const CACHE_MAX_ENTRIES = 500;
 const DROPPED_DISPLAY_LIMIT = 50;
 /** 攒够多少条新反馈才自动跑一次品味提炼（手动“立即重新学习”不受此限）。 */
 const DISTILL_EVERY = 25;
+const DISTILL_SAMPLE_LIMIT = 40;
 
 /** 候选选择：每个源在「保底轮」拿到的条数。 */
 const RESERVE_PER_SOURCE = 2;
@@ -398,6 +400,45 @@ function extractLink(block) {
   return candidates[0].href;
 }
 
+function xmlTextValue(raw) {
+  const cdata = /^\s*<!\[CDATA\[([\s\S]*?)\]\]>\s*$/.exec(raw);
+  return cdata ? cdata[1] : decodeEntities(raw);
+}
+
+/** Atom 默认是纯文本，尖括号可能是实验不等式或字面量。XHTML 则直接嵌入子元素。 */
+function atomTextOf(block, tag, readHtml) {
+  const match = new RegExp(`<${tag}(?=[\\s>])([^>]*?)>([\\s\\S]*?)<\\/${tag}>`, 'i').exec(block);
+  if (!match || attrOf(match[1], 'src')) return '';
+  const type = attrOf(match[1], 'type').toLowerCase().split(';')[0].trim();
+  if (type === 'xhtml' || type === 'application/xhtml+xml') return readHtml(match[2]);
+  if (!type || type === 'text' || type === 'text/plain') return xmlTextValue(match[2]);
+  return type === 'html' || type === 'text/html' ? readHtml(xmlTextValue(match[2])) : '';
+}
+
+function inlineArticleText(html) {
+  const text = extractArticleText(html);
+  if (text.length >= 120 && /<a\b/i.test(html)) {
+    // 有些订阅源把整页「相关文章」链接放在 content 里；链接外至少要有一段正文。
+    const unlinked = html.replace(/<a\b[^>]*>[\s\S]*?<\/a>/gi, ' ');
+    if (sanitizeExcerpt(extractArticleText(unlinked)).length < 120) return '';
+  }
+  return text;
+}
+
+/** RSS 全文或 Atom 的内联文本。跳过外部 src 和非文本 MIME 类型。 */
+function inlineFeedBody(block) {
+  const encoded = innerOf(block, 'content:encoded');
+  const text = encoded ? inlineArticleText(xmlTextValue(encoded)) : atomTextOf(block, 'content', inlineArticleText);
+  return truncate(sanitizeExcerpt(text), ARTICLE_MAX_CHARS);
+}
+
+/** 论文的结论通常在末尾，超长时保留起始方法与结尾结果。 */
+function shortenAbstract(text, limit) {
+  if (text.length <= limit) return text;
+  const tail = Math.floor(limit / 3);
+  return text.slice(0, limit - tail - 1) + '…' + text.slice(-tail);
+}
+
 /** 解析 RSS 2.0 / Atom / RSS 1.0（RDF）条目。 */
 export function parseFeed(xml, options = {}) {
   const limit = Number.isInteger(options.limit) && options.limit > 0 ? options.limit : 300;
@@ -406,7 +447,8 @@ export function parseFeed(xml, options = {}) {
   let match;
   const itemRe = /<item\b[^>]*>([\s\S]*?)<\/item>/gi;
   while ((match = itemRe.exec(text)) !== null) blocks.push(match[1]);
-  if (blocks.length === 0) {
+  const atom = blocks.length === 0;
+  if (atom) {
     const entryRe = /<entry\b[^>]*>([\s\S]*?)<\/entry>/gi;
     while ((match = entryRe.exec(text)) !== null) blocks.push(match[1]);
   }
@@ -414,18 +456,22 @@ export function parseFeed(xml, options = {}) {
   const items = [];
   for (const block of blocks) {
     if (items.length >= limit) break;
-    const title = htmlToText(innerOf(block, 'title'));
+    const title = atom ? oneLine(atomTextOf(block, 'title', htmlToText)) : htmlToText(innerOf(block, 'title'));
     if (!title) continue;
     let url = extractLink(block);
     if (!isHttpUrl(url)) url = htmlToText(innerOf(block, 'guid'));
     if (!isHttpUrl(url)) url = htmlToText(innerOf(block, 'id'));
     if (!isHttpUrl(url)) continue;
-    const excerptSource =
-      innerOf(block, 'description') ||
-      innerOf(block, 'summary') ||
-      innerOf(block, 'content:encoded') ||
-      innerOf(block, 'content');
-    const excerpt = truncate(sanitizeExcerpt(htmlToText(excerptSource)), 400);
+    const brief = sanitizeExcerpt(atom ? atomTextOf(block, 'summary', htmlToText) :
+      htmlToText(innerOf(block, 'description') || innerOf(block, 'summary')));
+    const paper = isArxivPaperUrl(url);
+    const feedBody = paper && brief.length >= 200 ? '' : inlineFeedBody(block);
+    let abstract = '';
+    if (paper) {
+      const text = brief.length >= 200 ? brief : feedBody;
+      if (text.length >= 200) abstract = shortenAbstract(text, ARXIV_ABSTRACT_MAX_CHARS);
+    }
+    const excerpt = truncate(brief || feedBody, 400);
     const dateSource =
       innerOf(block, 'pubDate') ||
       innerOf(block, 'published') ||
@@ -437,6 +483,8 @@ export function parseFeed(xml, options = {}) {
       url: url.trim(),
       excerpt,
       publishedAt: toIsoDate(dateSource),
+      ...(abstract && abstract !== excerpt ? { feedAbstract: abstract } : {}),
+      ...(feedBody.length >= 120 && !abstract ? { feedBody } : {}),
     });
   }
   return items;
@@ -675,7 +723,7 @@ export function prepareCandidates(rawItems, maxCandidates = 80, options = {}) {
     const url = String(raw.url ?? '').trim();
     if (!title || !isHttpUrl(url)) return;
     const urlKey = normalizeUrl(url);
-    const titleKey = normalizeTitleForDedup(title, raw.source);
+    const titleKey = normalizeTitleForDedup(title, raw.source, urlKey);
     if (!urlKey || !titleKey) return;
     if (seenUrls.has(urlKey) || seenTitles.has(titleKey)) return;
     seenUrls.add(urlKey);
@@ -1077,16 +1125,6 @@ async function fetchAndParseOnce(source, url, execCurl, proxy) {
   return { items: parsedItems, status: response.status };
 }
 
-async function fetchParseWithRetry(source, url, execCurl, proxy) {
-  let last = await fetchAndParseOnce(source, url, execCurl, proxy);
-  if (!last.error) return last;
-  if (last.transient) {
-    await delay(RETRY_DELAY_MS);
-    last = await fetchAndParseOnce(source, url, execCurl, proxy);
-  }
-  return last;
-}
-
 /** 目标是不是本机地址（RSSHub 之类），本机地址不走代理兜底。 */
 function isLoopbackUrl(value) {
   try {
@@ -1134,16 +1172,22 @@ async function fetchSource(source, config, deps) {
     return { report, items: [] };
   }
 
-  const problems = [];
+  const problems = new Map();
   let lastVia = '';
-  for await (const channel of fetchChannels(config.proxy, resolved.url, detectProxy)) {
-    lastVia = channel.via;
-    const outcome = await fetchParseWithRetry(source, resolved.url, execCurl, channel.proxy);
-    if (!outcome.error) {
+  let channels = fetchChannels(config.proxy, resolved.url, detectProxy);
+  for (let round = 0; round < 2; round++) {
+    const retry = [];
+    for await (const channel of channels) {
+      lastVia = channel.via;
+      const outcome = await fetchAndParseOnce(source, resolved.url, execCurl, channel.proxy);
+      if (outcome.error) {
+        problems.set(channel.via, `${channel.via === 'proxy' ? '代理' : '直连'}：${outcome.error}`);
+        if (outcome.transient) retry.push(channel);
+        continue;
+      }
       report.ok = true;
       report.count = outcome.items.length;
       report.via = channel.via;
-      report.error = '';
       log.debug(
         `源「${report.name}」抓到 ${outcome.items.length} 条（${channel.via === 'proxy' ? '代理' : '直连'}）`,
       );
@@ -1158,11 +1202,13 @@ async function fetchSource(source, config, deps) {
         })),
       };
     }
-    problems.push(`${channel.via === 'proxy' ? '代理' : '直连'}：${outcome.error}`);
+    if (round > 0 || !retry.length) break;
+    await delay(RETRY_DELAY_MS);
+    channels = retry;
   }
 
   report.via = lastVia;
-  report.error = problems.join('；') || '抓取失败（没有可用通道）';
+  report.error = [...problems.values()].join('；') || '抓取失败（没有可用通道）';
   return { report, items: [] };
 }
 
@@ -1268,8 +1314,20 @@ export function stripOutletSuffix(title, source) {
   return m[1].trim();
 }
 
-export function normalizeTitleForDedup(title, source) {
+const ENGLISH_EDITION_TITLE = /^(?:(?:AI|tech|science) )?(?:daily|weekly|monthly)(?: (?:AI|tech|science))?(?: (?:news|briefing|digest|newsletter|roundup|report|update))?$/i;
+const CHINESE_EDITION_TITLE = /^(?:(?:AI|人工智能|科技|科学|技术)\s*)?(?:日报|周报|月报|周刊|月刊)$/i;
+
+// 版本号可被多个项目复用，刊名可被每一期复用；两者都要靠链接识别。
+function titleNeedsUrl(base) {
+  if (!base) return false;
+  if (ENGLISH_EDITION_TITLE.test(base) || CHINESE_EDITION_TITLE.test(base)) return true;
+  const version = base.replace(/^(?:release(?: notes)?|changelog|version|发布说明|更新日志|版本(?:更新)?)[\s:：-]*/i, '');
+  return !version || /^v?\d+(?:\.\d+)*(?:[-+][a-z\d][a-z\d.+-]*)?$/i.test(version);
+}
+
+export function normalizeTitleForDedup(title, source, urlKey = '') {
   const base = stripOutletSuffix(title, source);
+  if (titleNeedsUrl(base)) return urlKey ? 'url:' + urlKey : '';
   const norm = normalizeTitle(base);
   const versions = numberSequence(base);
   return versions ? norm + '|' + versions : norm;
@@ -1297,11 +1355,15 @@ function bigramSimilarity(left, right) {
 
 function headlineSignature(item) {
   const base = stripOutletSuffix(item.title, item.source);
+  if (titleNeedsUrl(base)) return { editionUrl: item.urlKey || normalizeUrl(item.url) };
   const norm = base.replace(/[「」『』“”"'’·、，。！？：；,.!?:;()（）\[\]【】\s]/g, '').toLowerCase();
   return { norm, digits: numberSequence(base), grams: charBigrams(norm) };
 }
 
 function sameHeadline(left, right, threshold) {
+  if ('editionUrl' in left || 'editionUrl' in right) {
+    return Boolean(left.editionUrl && left.editionUrl === right.editionUrl);
+  }
   if (left.digits !== right.digits) return false;
   if (left.norm === right.norm) return true;
   if (left.norm.length < 8 || right.norm.length < 8) return false;
@@ -1359,7 +1421,7 @@ export function collapseDuplicates(items, options = {}) {
 
 /** 反馈文件结构（宽松读取，坏字段丢弃）。 */
 export function coerceFeedback(raw) {
-  const base = { version: 1, votes: {}, profile: { text: '', updatedAt: 0, basedOn: 0 }, updatedAt: 0 };
+  const base = { version: 1, votes: {}, profile: { text: '', updatedAt: 0, throughVoteAt: 0, basedOn: 0 }, updatedAt: 0 };
   if (!isPlainObject(raw)) return base;
   const votes = {};
   const rawVotes = isPlainObject(raw.votes) ? raw.votes : {};
@@ -1382,6 +1444,7 @@ export function coerceFeedback(raw) {
     profile: {
       text: typeof profile.text === 'string' ? profile.text.slice(0, 4000) : '',
       updatedAt: Number(profile.updatedAt) || 0,
+      throughVoteAt: Number(profile.throughVoteAt ?? profile.updatedAt) || 0,
       basedOn: Number(profile.basedOn) || 0,
     },
     updatedAt: Number(raw.updatedAt) || 0,
@@ -1396,7 +1459,7 @@ export function buildTasteSection(profile) {
 }
 
 /** 蒸馏 prompt：从反馈里提炼「可迁移的判据」，不是记住标题。 */
-export function buildDistillPrompt({ votes, currentProfile, interests, limit = 40 }) {
+export function buildDistillPrompt({ votes, currentProfile, interests, limit = DISTILL_SAMPLE_LIMIT }) {
   const rows = Object.values(votes)
     .sort((a, b) => b.at - a.at)
     .slice(0, limit)
@@ -1483,7 +1546,7 @@ const AI_SOURCE_IDS = new Set([
 /** 判断一条新闻是否属于「值得探索」的领域（AI / 计算机 / 科学）。 */
 export function isExplorationDomain(item) {
   if (item && AI_SOURCE_IDS.has(String(item.sourceId ?? ''))) return true;
-  const hay = `${item?.title ?? ''} ${item?.excerpt ?? ''} ${item?.category ?? ''} ${item?.source ?? ''}`;
+  const hay = `${item?.title ?? ''} ${item?.excerpt ?? ''}`;
   return EXPLORE_DOMAIN_PATTERN.test(hay);
 }
 
@@ -1539,8 +1602,8 @@ export function buildExplorePrompt(pool, count) {
   return { system, prompt: lines.join('\n') };
 }
 
-/** 解析探索挑选结果，返回被选中的候选（按序号）。 */
-export function parseExploreResponse(text, pool, count) {
+/** 空数组是编辑明确选零条，null 表示模型未提交可用的选择。 */
+function readExplorationChoices(text, pool, count) {
   if (!Number.isInteger(count) || count <= 0) return [];
   const list = Array.isArray(pool) ? pool.slice(0, EXPLORE_POOL_LIMIT) : [];
   const picked = [];
@@ -1548,24 +1611,24 @@ export function parseExploreResponse(text, pool, count) {
   const raw = String(text ?? '');
   const start = raw.indexOf('[');
   const end = raw.lastIndexOf(']');
-  if (start === -1 || end <= start) return picked;
-  let parsed;
-  try {
-    parsed = JSON.parse(raw.slice(start, end + 1));
-  } catch {
-    return picked;
-  }
-  if (!Array.isArray(parsed)) return picked;
+  if (start === -1 || end <= start) return null;
+  const parsed = tryJson(raw.slice(start, end + 1))?.value;
+  if (!Array.isArray(parsed)) return null;
   for (const row of parsed) {
-    const index = Number(row && typeof row === 'object' ? row.i ?? row.index : row);
-    if (!Number.isInteger(index)) continue;
+    const index = toIndex(isPlainObject(row) ? row.i ?? row.index : row);
+    if (index === undefined) continue;
     const item = list[index - 1];
     if (!item || seen.has(item.id)) continue;
     seen.add(item.id);
     picked.push({ item, topic: String((row && row.topic) || '').slice(0, 40) });
     if (picked.length >= count) break;
   }
-  return picked;
+  return parsed.length && !picked.length ? null : picked;
+}
+
+/** 解析探索挑选结果，返回被选中的候选（按序号）。 */
+export function parseExploreResponse(text, pool, count) {
+  return readExplorationChoices(text, pool, count) ?? [];
 }
 
 /** 丢掉过旧的条目（没有发布时间的保留，很多 feed 不带日期）。 */
@@ -1585,17 +1648,19 @@ export function filterFreshness(items, options = {}) {
   return { items: kept, dropped };
 }
 
-/** 丢掉最近几天已经推过的条目（id 或归一化标题命中都算重复）。 */
+/** 用已推送条目的 id、规范链接和具有辨识度的标题识别重复稿件。 */
 export function filterRepeats(items, options = {}) {
   const list = Array.isArray(items) ? items : [];
   const seenIds = options.seenIds instanceof Set ? options.seenIds : new Set(options.seenIds || []);
+  const seenUrls = options.seenUrls instanceof Set ? options.seenUrls : new Set(options.seenUrls || []);
   const seenTitles = options.seenTitles instanceof Set ? options.seenTitles : new Set(options.seenTitles || []);
-  if (seenIds.size === 0 && seenTitles.size === 0) return { items: list.slice(), dropped: [] };
+  if (seenIds.size === 0 && seenUrls.size === 0 && seenTitles.size === 0) return { items: list.slice(), dropped: [] };
   const kept = [];
   const dropped = [];
   for (const item of list) {
+    const urlKey = item.urlKey ?? normalizeUrl(item.url);
     const titleKey = item.titleKey ?? normalizeTitleForDedup(item.title, item.source);
-    if (seenIds.has(item.id) || (titleKey && seenTitles.has(titleKey))) dropped.push(item);
+    if (seenIds.has(item.id) || (urlKey && seenUrls.has(urlKey)) || (titleKey && seenTitles.has(titleKey))) dropped.push(item);
     else kept.push(item);
   }
   return { items: kept, dropped };
@@ -1647,12 +1712,16 @@ export function buildFilterPrompt(config, candidates, tasteProfile) {
   return { system, prompt: lines.join('\n') };
 }
 
-function hasArxivAbstract(item) {
-  if (typeof item.excerpt !== 'string' || item.excerpt.trim().length < 200) return false;
+function isArxivPaperUrl(value) {
   return attempt(() => {
-    const url = new URL(item.url);
+    const url = new URL(value);
     return /(^|\.)arxiv\.org$/i.test(url.hostname) && /^\/(abs|pdf|html)\//.test(url.pathname);
   }, false);
+}
+
+function arxivAbstractOf(item) {
+  const text = item.feedAbstract || item.excerpt;
+  return typeof text === 'string' && text.trim().length >= 200 && isArxivPaperUrl(item.url) ? text.trim() : '';
 }
 
 /** 逐条摘要用的 system + user prompt。 */
@@ -1663,18 +1732,18 @@ export function buildSummaryPrompt(item) {
   const body = typeof item.body === 'string' ? item.body.trim() : '';
   const excerpt = typeof item.excerpt === 'string' ? item.excerpt.trim() : '';
   // arXiv 的 abs 页面正文基本是 arXivLabs 样板字，真正的摘要在 RSS description 里
-  const preferExcerpt = hasArxivAbstract(item);
+  const abstract = arxivAbstractOf(item);
   let ask = '';
   if (item.compact) {
     // 上一轮被 maxTokens 截断：只给最要紧的素材，要求写短
-    const material = truncate(preferExcerpt ? excerpt : body || excerpt, 900);
+    const material = abstract ? shortenAbstract(abstract, 900) : truncate(body || excerpt, 900);
     if (material) lines.push('', '【素材（节选）】', material);
     ask = '素材有限：请用 2 句简体中文说清这条讲了什么（不超过 80 字），不要铺开。';
-  } else if (preferExcerpt) {
-    lines.push('', '【论文摘要（来自 arXiv feed）】', truncate(excerpt, 1_600));
+  } else if (abstract) {
+    lines.push('', '【论文摘要（来自 arXiv feed）】', shortenAbstract(abstract, ARXIV_ABSTRACT_MAX_CHARS));
     ask = '请用 3–5 句中文说清这篇论文做了什么、用什么方法、结论是什么、有什么局限（200–300 字）。';
   } else if (body) {
-    lines.push('', '【原文正文（节选）】', truncate(body, ARTICLE_MAX_CHARS));
+    lines.push('', body === item.feedBody ? '【订阅源内联正文（节选）】' : '【原文正文（节选）】', truncate(body, ARTICLE_MAX_CHARS));
     ask = '请写这条新闻的摘要（3–6 句中文，200–300 字）。';
   } else if (excerpt) {
     lines.push(`源摘要：${truncate(oneLine(excerpt), 500)}`);
@@ -2072,7 +2141,10 @@ export function pruneSummaryCache(cache, nowMs = Date.now(), options = {}) {
     if (typeof value.summary !== 'string' || !value.summary.trim()) continue;
     const at = Number(value.at);
     if (!Number.isFinite(at) || nowMs - at > ttlMs) continue;
-    rows.push([key, { summary: value.summary, at }]);
+    const basis = value.summaryBasis === 'excerpt'
+      ? { summaryBasis: 'excerpt', excerpt: typeof value.excerpt === 'string' ? value.excerpt : '' }
+      : {};
+    rows.push([key, { summary: value.summary, at, ...basis }]);
   }
   rows.sort((left, right) => right[1].at - left[1].at);
   const entries = {};
@@ -2500,6 +2572,65 @@ function writeJsonAtomic(file, value) {
   return writeFileAtomic(file, `${JSON.stringify(value, null, 2)}\n`);
 }
 
+// 跨进程的 Lamport 排队锁。每次调用拥有独立的文件，空文件表示正在选号。
+// 号码发布后新来的请求只能选更大的号。不会按文件年龄强拆仍在运行的事务。
+const TRANSACTION_OWNER = /^([1-9]\d*)-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+
+async function withFileTransaction(file, operation) {
+  const dir = path.join(path.dirname(file), '.dsh-locks');
+  const prefix = path.basename(file) + '.';
+  const id = process.pid + '-' + randomUUID();
+  const marker = (owner) => path.join(dir, prefix + owner);
+  async function others() {
+    const entries = await fsp.readdir(dir, { withFileTypes: true });
+    return entries.filter((e) => e.isFile() && e.name.startsWith(prefix))
+      .map((e) => e.name.slice(prefix.length)).filter((owner) => owner !== id && TRANSACTION_OWNER.test(owner));
+  }
+  async function ticket(owner) {
+    try {
+      const pid = Number(owner.split('-', 1)[0]);
+      if (pid !== process.pid) {
+        try {
+          process.kill(pid, 0);
+        } catch (error) {
+          if (error.code === 'ESRCH') {
+            // 名字包含 UUID，回收该进程留下的票不会释放其他请求的锁。
+            await fsp.unlink(marker(owner));
+            return null;
+          }
+          if (error.code !== 'EPERM') throw error;
+        }
+      }
+      return Number(await fsp.readFile(marker(owner), 'utf8'));
+    } catch (error) {
+      if (error.code === 'ENOENT') return null;
+      throw error;
+    }
+  }
+  await fsp.mkdir(dir, { recursive: true, mode: 0o700 });
+  await fsp.writeFile(marker(id), '', { flag: 'wx', mode: 0o600 });
+  try {
+    const issued = await Promise.all((await others()).map(ticket));
+    const number = Math.max(0, ...issued) + 1;
+    await writeFileAtomic(marker(id), String(number));
+    const rivals = await others();
+    const until = performance.now() + 10_000;
+    for (;;) {
+      const tickets = await Promise.all(rivals.map(ticket));
+      const first = tickets.every((n, i) => n === null || n > number || (n === number && rivals[i] > id));
+      if (first) return await operation();
+      if (performance.now() >= until) throw new Error(`等待更新 ${path.basename(file)} 超时，请重试`);
+      await delay(15);
+    }
+  } finally {
+    await fsp.unlink(marker(id));
+  }
+}
+
+export function digestRevision(digest) {
+  return digest ? digest.revision || digest.generatedAt || 'legacy' : null;
+}
+
 // ---------------------------------------------------------------------------
 // 运行时
 // ---------------------------------------------------------------------------
@@ -2662,8 +2793,8 @@ export function createRuntime(options = {}) {
   let running = false;
   let lastFailedAt = 0;
   let lastError = null;
-  let promptCache = '';
-  let hydrated = false;
+  let promptCache = { date: '', text: '', key: null, exists: false };
+  let promptRequest = 0;
   let proxyCache = { value: null, at: 0 };
   let proxyProbe = null;
 
@@ -2702,29 +2833,42 @@ export function createRuntime(options = {}) {
     return proxyProbe;
   }
 
+  function configForUpdate(read) {
+    if (!read.ok && read.error === 'ENOENT') return defaultConfig();
+    if (read.ok && isPlainObject(read.value)) return coerceConfig(read.value);
+    throw new ConfigError(`无法读取现有配置，请先修复 ${configFile}：${read.error || '配置必须是 JSON 对象'}`);
+  }
+
   async function loadConfig() {
     const read = await readJsonFile(configFile);
-    if (!read.ok) {
-      if (read.error === 'ENOENT') {
-        const config = defaultConfig();
-        try {
-          await writeJsonAtomic(configFile, config);
-          log.info(`已写入默认配置：${configFile}`);
-        } catch (error) {
-          log.warn(`写入默认配置失败（按内存默认值继续）：${messageOf(error)}`);
-        }
-        return config;
+    if (read.ok) return coerceConfig(read.value);
+    if (read.error === 'ENOENT') {
+      try {
+        return await withFileTransaction(configFile, async () => {
+          const latest = await readJsonFile(configFile);
+          const config = configForUpdate(latest);
+          if (!latest.ok) {
+            await writeJsonAtomic(configFile, config);
+            log.info(`已写入默认配置：${configFile}`);
+          }
+          return config;
+        });
+      } catch (error) {
+        log.warn(`初始化配置失败（按内存默认值继续）：${messageOf(error)}`);
       }
+    } else {
       log.warn(`读取配置失败，按默认值继续：${read.error}`);
-      return defaultConfig();
     }
-    return coerceConfig(read.value);
+    return defaultConfig();
   }
 
   async function saveConfigPatch(patch) {
-    const current = await loadConfig();
-    const next = applyConfigPatch(current, patch);
-    await writeJsonAtomic(configFile, next);
+    const next = await withFileTransaction(configFile, async () => {
+      const current = configForUpdate(await readJsonFile(configFile));
+      const updated = applyConfigPatch(current, patch);
+      await writeJsonAtomic(configFile, updated);
+      return updated;
+    });
     proxyCache = { value: proxyCache.value, at: 0 };
     proxyProbe = null;
     await refreshPromptText();
@@ -2733,6 +2877,7 @@ export function createRuntime(options = {}) {
 
   // 桌面版将结构与 Markdown 一起原子写入，自带定时器的 Harness 仍可独立写它的两份文件。
   const desktopDigestPath = (date) => path.join(root, 'chatgpt', 'digest', date + '.json');
+  const archiveKey = (date) => path.join(root, 'digest-' + date);
 
   async function readEdition(file, date) {
     const parsed = await readJsonFile(file);
@@ -2763,6 +2908,11 @@ export function createRuntime(options = {}) {
     return timeValue(desktop.generatedAt) >= timeValue(harness.generatedAt) ? desktop : harness;
   }
 
+  async function supersedingEdition(date, baseline) {
+    const latest = await readDigest(date);
+    return latest && digestRevision(latest) !== baseline ? latest : null;
+  }
+
   async function hasDigest(date) {
     return Boolean(await readDigest(date));
   }
@@ -2778,30 +2928,49 @@ export function createRuntime(options = {}) {
     }
   }
 
-  async function refreshPromptText() {
+  async function editionStamp(file) {
     try {
-      const config = await loadConfig();
-      if (!config.announceToAgent) {
-        promptCache = '';
-        return;
-      }
-      const date = today();
-      const digest = await readDigest(date);
-      // 只认今天的：否则跨天后系统提示词里还挂着昨天的简报
-      promptCache = digest && digest.date === date ? buildPromptText(digest) : '';
+      const stat = await fsp.stat(file, { bigint: true });
+      return [stat.dev, stat.ino, stat.size, stat.mtimeNs, stat.ctimeNs].join(':');
     } catch (error) {
-      promptCache = '';
+      if (error?.code === 'ENOENT') return '';
+      throw error;
+    }
+  }
+
+  // 定时器只检查两份归档的文件信息；桌面聊天或另一个 Harness 替换文件后再读取正文。
+  async function refreshPromptText(knownConfig) {
+    const request = ++promptRequest;
+    const date = today();
+    try {
+      const config = knownConfig ?? await loadConfig();
+      if (!config.enabled) {
+        if (request === promptRequest) promptCache = { date, text: '', key: null, exists: false };
+        return false;
+      }
+      const stamps = await Promise.all([editionStamp(digestJsonPath(date)), editionStamp(desktopDigestPath(date))]);
+      const key = [date, config.announceToAgent, ...stamps].join('|');
+      if (key === promptCache.key) return promptCache.exists;
+      const hasFiles = stamps.some(Boolean);
+      const digest = hasFiles ? await readDigest(date) : null;
+      const exists = Boolean(digest);
+      const text = config.announceToAgent && digest?.date === date ? buildPromptText(digest) : '';
+      if (request === promptRequest) {
+        // 文件存在却读不出来时留给下次轮询重试。
+        promptCache = { date, text, key: exists || !hasFiles ? key : null, exists };
+      }
+      return exists;
+    } catch (error) {
+      if (request === promptRequest) promptCache = { date, text: '', key: null, exists: false };
       log.warn(`刷新 systemPrompt 文本失败：${messageOf(error)}`);
+      return false;
     }
   }
 
   let hydratePromise = null;
   async function hydrate() {
     if (hydratePromise) return hydratePromise;
-    hydratePromise = (async () => {
-      await loadConfig();
-      await refreshPromptText();
-    })();
+    hydratePromise = refreshPromptText();
     try {
       await hydratePromise;
     } catch (error) {
@@ -3078,9 +3247,11 @@ export function createRuntime(options = {}) {
     };
   }
 
-  async function readFeedbackStored() {
+  async function readFeedbackStored({ forUpdate = false } = {}) {
     const raw = await readJsonFile(feedbackFile);
-    if (!raw.ok) return coerceFeedback(undefined);
+    if (forUpdate && raw.error !== 'ENOENT' && (!raw.ok || !isPlainObject(raw.value))) {
+      throw new HttpError(409, `无法读取现有反馈，请检查 ${feedbackFile}（${raw.error || '反馈必须是 JSON 对象'}）`);
+    }
     return coerceFeedback(raw.value);
   }
 
@@ -3088,17 +3259,17 @@ export function createRuntime(options = {}) {
     return (await readFeedbackStored()).profile.text;
   }
 
-  async function writeFeedbackStored(data) {
-    data.updatedAt = clock().getTime();
+  async function writeFeedbackStored(data, at = Math.max(clock().getTime(), data.updatedAt + 1)) {
+    data.updatedAt = at;
     await writeJsonAtomic(feedbackFile, data);
   }
 
-  // 反馈文件的所有「读-改-写」串行化：否则连点两下会互相覆盖
-  let feedbackQueue = Promise.resolve();
   function withFeedbackLock(fn) {
-    const run = feedbackQueue.then(fn, fn);
-    feedbackQueue = run.then(() => {}, () => {});
-    return run;
+    return withFileTransaction(feedbackFile, fn);
+  }
+
+  function pendingVotes(data) {
+    return Object.values(data.votes).filter((vote) => vote.at > data.profile.throughVoteAt).length;
   }
 
   let distilling = false;
@@ -3107,12 +3278,13 @@ export function createRuntime(options = {}) {
     if (distilling) return { ok: false, busy: true };
     // 先置位再 await：否则几个 await 的窗口里并发调用都能通过上面的检查
     distilling = true;
+    let learnAgain = false;
     try {
-      const data = await readFeedbackStored();
+      const data = await readFeedbackStored({ forUpdate: true });
       const votes = Object.values(data.votes);
-      const pending = votes.filter((v) => v.at > (data.profile.updatedAt || 0));
-      if (!force && pending.length < DISTILL_EVERY) {
-        return { ok: false, skipped: true, pending: pending.length };
+      const pending = pendingVotes(data);
+      if (!force && pending < DISTILL_EVERY) {
+        return { ok: false, skipped: true, pending };
       }
       if (votes.length === 0) return { ok: false, skipped: true, pending: 0 };
       const config = await loadConfig();
@@ -3132,13 +3304,26 @@ export function createRuntime(options = {}) {
       });
       const profile = sanitizeTasteProfile(text);
       if (!profile) return { ok: false, error: '模型返回了空的品味档案' };
-      // 关键：模型调用期间产生的投票不能被这次写回覆盖 —— 重新读盘，只更新 profile
+      // 新增投票留给下一轮。撤票、改票、复原或另一轮学习完成后，不再写回旧判据。
       const saved = await withFeedbackLock(async () => {
-        const latest = await readFeedbackStored();
-        latest.profile = { text: profile, updatedAt: clock().getTime(), basedOn: Object.keys(latest.votes).length };
+        const latest = await readFeedbackStored({ forUpdate: true });
+        const changed = latest.profile.updatedAt !== data.profile.updatedAt ||
+          Object.entries(data.votes).some(([id, vote]) => latest.votes[id]?.at !== vote.at || latest.votes[id]?.vote !== vote.vote);
+        if (changed) {
+          learnAgain = pendingVotes(latest) >= DISTILL_EVERY;
+          return null;
+        }
+        latest.profile = {
+          text: profile,
+          updatedAt: Math.max(clock().getTime(), latest.profile.updatedAt + 1),
+          basedOn: Math.min(votes.length, DISTILL_SAMPLE_LIMIT),
+          throughVoteAt: votes.reduce((last, vote) => Math.max(last, vote.at), data.profile.throughVoteAt),
+        };
         await writeFeedbackStored(latest);
+        learnAgain = pendingVotes(latest) >= DISTILL_EVERY;
         return latest.profile;
       });
+      if (!saved) return { ok: false, error: '学习期间原有反馈或品味档案已更改，本次学习结果已舍弃' };
       log.info(`品味档案已更新（基于 ${saved.basedOn} 条反馈）`);
       return { ok: true, profile: saved };
     } catch (error) {
@@ -3146,6 +3331,7 @@ export function createRuntime(options = {}) {
       return { ok: false, error: messageOf(error) };
     } finally {
       distilling = false;
+      if (learnAgain) void distillTaste(false);
     }
   }
 
@@ -3156,21 +3342,22 @@ export function createRuntime(options = {}) {
     if (!id) throw new HttpError(400, '缺少条目 id');
     if (vote !== 'up' && vote !== 'down' && vote !== null) throw new HttpError(400, 'vote 只能是 up / down / null');
     return await withFeedbackLock(async () => {
-      const data = await readFeedbackStored();
+      const data = await readFeedbackStored({ forUpdate: true });
+      const at = Math.max(clock().getTime(), data.updatedAt + 1, data.profile.throughVoteAt + 1);
       if (vote === null) delete data.votes[id];
       else {
         data.votes[id] = {
           vote,
-          at: clock().getTime(),
+          at,
           title: String(body?.title ?? '').slice(0, 300),
           source: String(body?.source ?? '').slice(0, 80),
           category: String(body?.category ?? '').slice(0, 40),
           reason: String(body?.reason ?? '').slice(0, 200),
         };
       }
-      await writeFeedbackStored(data);
+      await writeFeedbackStored(data, at);
       // 攒够 DISTILL_EVERY 条新反馈就在后台提炼一次，不阻塞这次点击
-      const pending = Object.values(data.votes).filter((v) => v.at > (data.profile.updatedAt || 0)).length;
+      const pending = pendingVotes(data);
       if (pending >= DISTILL_EVERY) void distillTaste(false);
       return { votes: Object.keys(data.votes).length, pending, profile: data.profile };
     });
@@ -3255,8 +3442,8 @@ export function createRuntime(options = {}) {
         timeoutMs: 60_000,
         label: '探索位挑选',
       });
-      const picked = parseExploreResponse(text, gated, Math.min(count, gated.length));
-      if (picked.length === 0) return heuristic();
+      const picked = readExplorationChoices(text, gated, Math.min(count, gated.length));
+      if (picked === null) throw new Error('模型没有返回有效的探索编号');
       return picked.map(({ item, topic }) => ({
         ...item,
         explore: true,
@@ -3269,46 +3456,77 @@ export function createRuntime(options = {}) {
     }
   }
 
-  async function loadSummaryCache(errors) {
-    const read = await readJsonFile(cacheFile);
+  async function loadSummaryHistory(errors, date) {
+    const [read, previous] = await Promise.all([readJsonFile(cacheFile), readDigest(date)]);
     if (!read.ok && read.error !== 'ENOENT') errors.push(`摘要缓存读取失败（当作空缓存继续）：${read.error}`);
-    return pruneSummaryCache(read.value, clock().getTime());
+    const cache = pruneSummaryCache(read.value, clock().getTime());
+    const previousItems = new Map((previous?.items ?? [])
+      .filter((item) => item?.id && typeof item.summary === 'string' && item.summary.trim())
+      .map((item) => [item.id, item]));
+    function findSummary(item) {
+      const records = [previousItems.get(item.id), cache.entries[summaryCacheKey(item.id)]].filter(Boolean);
+      // 保留旧格式摘要的复用行为。有完整摘要时，优先于仅凭摘录写出的那份。
+      return records.find((record) => record.summaryBasis !== 'excerpt') ||
+        records.find((record) => (record.excerpt || '') === (item.excerpt || ''));
+    }
+    return findSummary;
   }
 
   async function articleBodyFor(item, config, deadline) {
-    if (hasArxivAbstract(item)) return '';
-    return readArticleBody(item.url, config, deadline).catch(() => '');
+    if (arxivAbstractOf(item)) return '';
+    const inline = item.feedBody || '';
+    if (inline.length >= ARTICLE_MAX_CHARS) return inline;
+    const article = await readArticleBody(item.url, config, deadline).catch(() => '');
+    return article.length >= inline.length ? article : inline;
+  }
+
+  function useSavedSummary(item, saved) {
+    item.summary = saved.summary;
+    if (saved.summaryBasis === 'excerpt') item.summaryBasis = 'excerpt';
+    else delete item.summaryBasis;
+  }
+
+  // 有完整摘要时直接复用。上次仅有标题/摘录时重试正文，素材依然相同就省去模型调用。
+  async function prepareSummaryMaterial(item, config, deadline, saved, canFetch) {
+    if (saved && (saved.summaryBasis !== 'excerpt' || !canFetch)) {
+      useSavedSummary(item, saved);
+      return null;
+    }
+    if (!canFetch) return null;
+    const body = await articleBodyFor(item, config, deadline);
+    if (!body && !arxivAbstractOf(item)) {
+      item.summaryBasis = 'excerpt';
+      if (saved) {
+        item.summary = saved.summary;
+        return null;
+      }
+    } else {
+      delete item.summaryBasis;
+    }
+    item.summary = '';
+    return { body };
   }
 
   async function desktopMaterials(items, errors, date) {
     if (!items.length) return [];
-    const [config, cache, previous] = await Promise.all([loadConfig(), loadSummaryCache(errors), readDigest(date)]);
-    const previousSummaries = new Map((previous?.items ?? [])
-      .filter((item) => item?.id && typeof item.summary === 'string' && item.summary.trim())
-      .map((item) => [item.id, item.summary]));
+    const [config, findSummary] = await Promise.all([loadConfig(), loadSummaryHistory(errors, date)]);
     const deadline = clock().getTime() + GENERATION_BUDGET_MS;
-    let noBody = 0;
     const materials = await mapPool(items, FETCH_CONCURRENCY, async (item) => {
-      const cached = previousSummaries.get(item.id) || cache.entries[summaryCacheKey(item.id)]?.summary;
-      if (cached) {
-        item.summary = cached;
-        return { id: item.id, cached: true };
-      }
-      const body = await articleBodyFor(item, config, deadline);
-      if (!body && !hasArxivAbstract(item)) noBody++;
-      return { id: item.id, prompt: buildSummaryPrompt({ ...item, url: redactSecrets(item.url), body }).prompt };
+      const material = await prepareSummaryMaterial(item, config, deadline, findSummary(item), true);
+      if (!material) return { id: item.id, cached: true };
+      return { id: item.id, prompt: buildSummaryPrompt({ ...item, url: redactSecrets(item.url), body: material.body }).prompt };
     });
-    if (noBody) errors.push(`${noBody} 条没有抓到正文，摘要依据为标题与可用的源摘录`);
+    const noBody = items.filter((item) => item.summaryBasis === 'excerpt').length;
+    if (noBody) errors.push(`${noBody} 条摘要生成时没有抓到正文，依据为标题与可用的源摘录`);
     return materials;
   }
 
-  async function summarizeItems(items, config, route, errors, deadline) {
+  async function summarizeItems(items, config, route, errors, deadline, date) {
     if (items.length === 0) return;
 
-    const cache = await loadSummaryCache(errors);
-    let cacheDirty = false;
+    const findSummary = await loadSummaryHistory(errors, date);
+    const updates = new Map();
     let skipped = 0;
-    let noBody = 0;
     let noModel = 0;
 
     // 最多 6 条在抓取或总结途中，正文先就绪的先用模型，模型并发仍最多 3 条。
@@ -3323,21 +3541,16 @@ export function createRuntime(options = {}) {
     });
     await mapPool(items, FETCH_CONCURRENCY, async (item) => {
       const key = summaryCacheKey(item.id);
-      const hit = key ? cache.entries[key] : undefined;
-      if (hit && typeof hit.summary === 'string' && hit.summary.trim()) {
-        item.summary = hit.summary;
-        return;
-      }
-      if (!route) {
-        noModel += 1;
-        return;
-      }
-      if (clock().getTime() >= deadline) {
-        skipped += 1;
-        return;
-      }
+      const saved = findSummary(item);
       try {
-        const body = await articleBodyFor(item, config, deadline);
+        const canFetch = Boolean(route) && clock().getTime() < deadline;
+        const material = await prepareSummaryMaterial(item, config, deadline, saved, canFetch);
+        if (!material) {
+          if (!item.summary && !route) noModel++;
+          else if (!item.summary) skipped++;
+          return;
+        }
+        const { body } = material;
         const text = await withModelSlot(async () => {
           if (clock().getTime() >= deadline) return null;
           try {
@@ -3349,31 +3562,45 @@ export function createRuntime(options = {}) {
           }
         });
         if (text === null) {
-          skipped += 1;
+          if (saved) useSavedSummary(item, saved);
+          else skipped++;
           return;
         }
         const summary = sanitizeSummary(text);
         if (!summary) throw new Error('模型返回了空摘要');
-        if (!body && !hasArxivAbstract(item)) noBody += 1;
         item.summary = summary;
         if (key) {
-          cache.entries[key] = { summary, at: clock().getTime() };
-          cacheDirty = true;
+          const basis = item.summaryBasis === 'excerpt' ? { summaryBasis: 'excerpt', excerpt: item.excerpt || '' } : {};
+          updates.set(key, { summary, at: clock().getTime(), ...basis });
         }
       } catch (error) {
-        item.summary = '';
-        errors.push(`「${truncate(item.title, 40)}」摘要生成失败：${messageOf(error)}`);
+        if (saved) useSavedSummary(item, saved);
+        errors.push(`「${truncate(item.title, 40)}」摘要生成失败：${messageOf(error)}${saved ? '，已沿用原有摘录摘要' : ''}`);
       }
     });
 
     if (noModel > 0) errors.push(`模型不可用，${noModel} 条没有生成逐条中文总结（条目只有标题与源摘要可用）`);
     if (skipped > 0) errors.push(`整体生成超过时间预算，${skipped} 条保留项未生成摘要`);
+    const noBody = items.filter((item) => item.summary && item.summaryBasis === 'excerpt').length;
     if (noBody > 0) {
-      errors.push(`${noBody} 条没有抓到正文（只按标题与源摘要生成），这些摘要细节会偏少`);
+      errors.push(`${noBody} 条摘要生成时没有抓到正文，依据为标题与可用的源摘录`);
     }
-    if (cacheDirty) {
+    if (updates.size) {
       try {
-        await writeJsonAtomic(cacheFile, pruneSummaryCache(cache, clock().getTime()));
+        await withFileTransaction(cacheFile, async () => {
+          const read = await readJsonFile(cacheFile);
+          const now = clock().getTime();
+          const cache = pruneSummaryCache(read.value, now);
+          for (const [key, update] of updates) {
+            const previous = cache.entries[key];
+            // 并发刷新可能已经取得更好的依据；依据相同则保留较新的结果。
+            if (previous && previous.summaryBasis !== update.summaryBasis) {
+              if (update.summaryBasis === 'excerpt') continue;
+            } else if (previous && previous.at > update.at) continue;
+            cache.entries[key] = update;
+          }
+          await writeJsonAtomic(cacheFile, pruneSummaryCache(cache, now));
+        });
       } catch (error) {
         errors.push(`摘要缓存写入失败（不影响本次结果）：${messageOf(error)}`);
       }
@@ -3382,6 +3609,7 @@ export function createRuntime(options = {}) {
 
   async function readRecentItemKeys(start, days) {
     const seenIds = new Set();
+    const seenUrls = new Set();
     const seenTitles = new Set();
     const dates = Array.from({ length: days }, (_, i) => {
       const past = new Date(start);
@@ -3393,12 +3621,13 @@ export function createRuntime(options = {}) {
         for (const item of digest?.items ?? []) {
           if (!isPlainObject(item)) continue;
           if (item.id) seenIds.add(item.id);
+          if (item.url) seenUrls.add(normalizeUrl(item.url));
           const titleKey = normalizeTitleForDedup(item.title, item.source);
           if (titleKey) seenTitles.add(titleKey);
         }
       }
     });
-    return { seenIds, seenTitles };
+    return { seenIds, seenUrls, seenTitles };
   }
 
   async function collectCandidates(config, start = clock()) {
@@ -3539,6 +3768,7 @@ export function createRuntime(options = {}) {
   function assembleDigest({ date, candidates, sourceReports, errors }, { items, dropped }, filterMode) {
     const digest = {
       date,
+      revision: randomUUID(),
       generatedAt: clock().toISOString(),
       items: items.map(toDigestItem),
       dropped: dropped
@@ -3586,7 +3816,7 @@ export function createRuntime(options = {}) {
     }
 
     const selected = await selectReviewedItems(batch, config, judgement, route);
-    await summarizeItems(selected.items, config, route, errors, deadline);
+    await summarizeItems(selected.items, config, route, errors, deadline, batch.date);
     return assembleDigest(batch, selected, filterMode);
   }
 
@@ -3601,25 +3831,44 @@ export function createRuntime(options = {}) {
       publishedAt: item.publishedAt || '',
       excerpt: item.excerpt || '',
       summary: item.summary || '',
+      ...(item.summary && item.summaryBasis === 'excerpt' ? { summaryBasis: 'excerpt' } : {}),
       reason: item.reason || '',
       // 探索位：前端会打个「探索」标记，反馈时也更有参考价值
       ...(item.explore ? { explore: true } : {}),
     };
   }
 
-  async function writeDigest(digest) {
+  async function commitDigest(digest, baseline, write) {
+    if (!isDateString(digest.date)) throw new Error('简报日期无效');
+    return withFileTransaction(archiveKey(digest.date), async () => {
+      const latest = await readDigest(digest.date);
+      if (baseline !== undefined && latest && digestRevision(latest) !== baseline) {
+        return { digest: latest, superseded: true };
+      }
+      // 两个入口共享 generatedAt 的先后顺序，包括同一毫秒完成或系统时钟回拨。
+      const previous = timeValue(latest?.generatedAt);
+      const saved = previous >= 0 && timeValue(digest.generatedAt) <= previous
+        ? { ...digest, generatedAt: new Date(previous + 1).toISOString() }
+        : digest;
+      await write(saved);
+      return { digest: saved, superseded: false };
+    });
+  }
+
+  function writeDigest(digest) {
     // 先写 Markdown 再写 JSON：JSON 是「这天已有简报」的判定依据，
     // 反过来的话 md 写失败会留下「有 JSON 无正文」的残缺状态，且再也不会重试。
-    await writeFileAtomic(digestMarkdownPath(digest.date), `${digest.markdown}\n`);
-    await writeJsonAtomic(digestJsonPath(digest.date), digest);
+    return commitDigest(digest, undefined, async (saved) => {
+      await writeFileAtomic(digestMarkdownPath(saved.date), `${saved.markdown}\n`);
+      await writeJsonAtomic(digestJsonPath(saved.date), saved);
+    });
   }
 
   async function generate(options = {}) {
     if (running) return { ok: false, busy: true, error: '正在生成今天的简报，请稍候' };
     running = true;
     try {
-      const digest = await buildDigest(options);
-      await writeDigest(digest);
+      const { digest } = await writeDigest(await buildDigest(options));
       lastError = null;
       try {
         await refreshPromptText();
@@ -3645,9 +3894,9 @@ export function createRuntime(options = {}) {
     if (running) return { ok: true, skipped: 'running' };
     try {
       const config = await loadConfig();
+      const exists = await refreshPromptText(config);
       if (!config.enabled) return { ok: true, skipped: 'disabled' };
-      const date = today();
-      if (await hasDigest(date)) return { ok: true, skipped: 'exists' };
+      if (exists) return { ok: true, skipped: 'exists' };
       // 用 >= 而不是 ==：08:00 那一分钟如果失败了，后面的 tick 还要能补上
       if (localHm(clock()) < config.dailyTime) return { ok: true, skipped: 'time' };
       if (lastFailedAt && clock().getTime() - lastFailedAt < TICK_RETRY_COOLDOWN_MS) {
@@ -3668,9 +3917,9 @@ export function createRuntime(options = {}) {
     if (running) return { ok: true, skipped: 'running' };
     try {
       const config = await loadConfig();
+      const exists = await refreshPromptText(config);
       if (!config.enabled) return { ok: true, skipped: 'disabled' };
-      const date = today();
-      if (await hasDigest(date)) return { ok: true, skipped: 'exists' };
+      if (exists) return { ok: true, skipped: 'exists' };
       return await generate({ trigger: 'mount' });
     } catch (error) {
       const message = messageOf(error);
@@ -3710,12 +3959,16 @@ export function createRuntime(options = {}) {
 
   async function handleState(request) {
     const url = new URL(request?.url ?? ROUTE_PATHS.state, 'http://localhost');
-    if (url.searchParams.get('view') === 'status') {
+    const view = url.searchParams.get('view');
+    if (view === 'status') {
       return { body: { ok: true, running, lastError } };
     }
-    const config = await loadConfig();
-    const date = today();
-    const digest = await readDigest(date);
+    const settingsOnly = view === 'settings';
+    const [config, fb, proxyDetected, digest] = await Promise.all([
+      loadConfig(), readFeedbackStored(), detectProxy(), settingsOnly ? null : readDigest(today()),
+    ]);
+    const taste = { voteCount: Object.keys(fb.votes).length, profile: fb.profile };
+    if (settingsOnly) return { body: { ok: true, config, taste, proxyDetected, digestDir: root } };
     return {
       body: {
         ok: true,
@@ -3724,19 +3977,12 @@ export function createRuntime(options = {}) {
         running,
         lastError,
         digestDir: root,
-        proxyDetected: await detectProxy(),
+        proxyDetected,
         // 现场探针：看到 candidateSelection 说明宿主已加载「按源保底」这版代码
         version: CODE_VERSION,
         // 只回缓存，state 不应该因为检查更新而变慢
         update: updateCache.value,
-        taste: await (async () => {
-          const fb = await readFeedbackStored();
-          return {
-            votes: Object.fromEntries(Object.entries(fb.votes).map(([id, v]) => [id, v.vote])),
-            voteCount: Object.keys(fb.votes).length,
-            profile: fb.profile,
-          };
-        })(),
+        taste: { ...taste, votes: Object.fromEntries(Object.entries(fb.votes).map(([id, v]) => [id, v.vote])) },
         candidateSelection: {
           mode: 'reserve-then-fill',
           reservePerSource: RESERVE_PER_SOURCE,
@@ -3793,7 +4039,7 @@ export function createRuntime(options = {}) {
   async function resetTaste() {
     // 读、备份、清空必须在同一把锁里，否则并发投票会落在「读」和「清空」之间被抹掉
     return await withFeedbackLock(async () => {
-      const data = await readFeedbackStored();
+      const data = await readFeedbackStored({ forUpdate: true });
       const voteCount = Object.keys(data.votes).length;
       const hadProfile = Boolean(data.profile.text);
       if (voteCount === 0 && !hadProfile) {
@@ -3805,7 +4051,7 @@ export function createRuntime(options = {}) {
       } catch (error) {
         log.warn(`反馈备份写入失败（继续复原）：${messageOf(error)}`);
       }
-      await writeFeedbackStored(coerceFeedback(undefined));
+      await writeFeedbackStored(coerceFeedback(undefined), Math.max(clock().getTime(), data.updatedAt + 1));
       log.info(`品味已复原：清空 ${voteCount} 条反馈${hadProfile ? '与品味档案' : ''}`);
       return { ok: true, votes: voteCount, hadProfile };
     });
@@ -3860,14 +4106,15 @@ export function createRuntime(options = {}) {
     readDigest,
     readMarkdown,
     desktop: {
+      now: clock,
       collectCandidates,
       readTasteProfile,
       selectReviewedItems,
       materials: desktopMaterials,
       assembleDigest,
-      async save(digest) {
-        if (!isDateString(digest.date)) throw new Error('简报日期无效');
-        await writeJsonAtomic(desktopDigestPath(digest.date), digest);
+      supersedingEdition,
+      save(digest, baseline) {
+        return commitDigest(digest, baseline, (saved) => writeJsonAtomic(desktopDigestPath(saved.date), saved));
       },
     },
     refreshPromptText,
@@ -3891,7 +4138,7 @@ export function createRuntime(options = {}) {
     checkUpdate,
     isRunning: () => running,
     lastError: () => lastError,
-    promptText: () => promptCache,
+    promptText: () => promptCache.date === today() ? promptCache.text : '',
   };
 }
 

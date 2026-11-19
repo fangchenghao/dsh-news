@@ -607,6 +607,7 @@ a.rssnews_set_itemTitle:hover{text-decoration:underline;text-underline-offset:3p
     }
 
     const readState = () => callApi('/api/dsh-news/state')
+    const readSettings = () => callApi('/api/dsh-news/state?view=settings')
     const readStatus = () => callApi('/api/dsh-news/state?view=status')
     const triggerRefresh = () => callApi('/api/dsh-news/refresh', {
       method: 'POST',
@@ -1625,6 +1626,16 @@ function SourceRow(props) {
       )
     }
 
+    function changedSettings(base, draft) {
+      const changes = {}
+      for (const [key, value] of Object.entries(draft)) {
+        if (value === base[key]) continue
+        if (value && typeof value === 'object' && JSON.stringify(value) === JSON.stringify(base[key])) continue
+        changes[key] = value
+      }
+      return changes
+    }
+
     function SettingsSection() {
       const [state, setState] = useState(null)
       const [draft, setDraft] = useState(null)
@@ -1642,6 +1653,8 @@ function SourceRow(props) {
       const [resetting, setResetting] = useState(false)
       const [confirmReset, setConfirmReset] = useState(false)
       const resetTimer = useRef(null)
+      const savedConfig = useRef(null)
+      const settingsRequest = useRef(0)
       const alive = useRef(true)
 
       useEffect(() => {
@@ -1653,14 +1666,19 @@ function SourceRow(props) {
       }, [])
 
       const load = useCallback(async () => {
+        const request = ++settingsRequest.current
         try {
-          const st = await readState()
-          if (!alive.current) return
+          const st = await readSettings()
+          if (!alive.current || request !== settingsRequest.current) return
+          const previous = savedConfig.current
+          savedConfig.current = st.config
           setState(st)
-          setDraft((current) => (current == null ? (st.config || null) : current))
+          setDraft((current) => current && previous
+            ? { ...st.config, ...changedSettings(previous, current) }
+            : st.config)
           setError('')
         } catch (e) {
-          if (alive.current) setError(e.message || String(e))
+          if (alive.current && request === settingsRequest.current) setError(e.message || String(e))
         } finally {
           if (alive.current) setLoading(false)
         }
@@ -1759,16 +1777,17 @@ function SourceRow(props) {
       }, [learning, load])
 
       const onSave = useCallback(async () => {
-        if (draft == null || saving) return
+        if (!draft || !savedConfig.current || saving) return
         setSaving(true)
         setError('')
         try {
-          const body = await saveConfig(draft)
+          const body = await saveConfig(changedSettings(savedConfig.current, draft))
           if (!alive.current) return
           if (body && body.config) {
+            settingsRequest.current++
+            savedConfig.current = body.config
             setState((prev) => Object.assign({}, prev, { config: body.config }))
-            // 只有草稿没被继续编辑时才用响应覆盖
-            setDraft((current) => (current === draft ? body.config : current))
+            setDraft((current) => current === draft ? body.config : { ...body.config, ...changedSettings(draft, current) })
           }
           setNotice(T.saved)
         } catch (e) {
@@ -1810,9 +1829,9 @@ function SourceRow(props) {
         )
       }
 
-      const patch = (next) => setDraft(Object.assign({}, draft, next))
+      const patch = (next) => setDraft((current) => ({ ...current, ...next }))
       const model = draft.model || { provider: '', model: '' }
-      const dirty = Boolean(state && state.config && JSON.stringify(state.config) !== JSON.stringify(draft))
+      const dirty = Boolean(state && state.config && Object.keys(changedSettings(state.config, draft)).length)
 
       const saveButton = h('button', {
         className: 'rssnews_set_btn rssnews_set_btnPrimary',
@@ -1954,7 +1973,7 @@ function SourceRow(props) {
                 value: draft.maxCandidates == null ? 80 : draft.maxCandidates,
                 onChange: (e) => {
                   const raw = e.target.value
-                  patch({ maxCandidates: raw === '' ? undefined : Number(raw) })
+                  patch({ maxCandidates: raw === '' ? 80 : Number(raw) })
                 },
               }),
             ),
@@ -1967,7 +1986,7 @@ function SourceRow(props) {
                 value: draft.maxItems == null ? 25 : draft.maxItems,
                 onChange: (e) => {
                   const raw = e.target.value
-                  patch({ maxItems: raw === '' ? undefined : Number(raw) })
+                  patch({ maxItems: raw === '' ? 25 : Number(raw) })
                 },
               }),
             ),
@@ -1980,7 +1999,7 @@ function SourceRow(props) {
                 value: draft.maxAgeDays == null ? 3 : draft.maxAgeDays,
                 onChange: (e) => {
                   const raw = e.target.value
-                  patch({ maxAgeDays: raw === '' ? undefined : Number(raw) })
+                  patch({ maxAgeDays: raw === '' ? 3 : Number(raw) })
                 },
               }),
             ),
@@ -1993,7 +2012,7 @@ function SourceRow(props) {
                 value: draft.repeatWindowDays == null ? 7 : draft.repeatWindowDays,
                 onChange: (e) => {
                   const raw = e.target.value
-                  patch({ repeatWindowDays: raw === '' ? undefined : Number(raw) })
+                  patch({ repeatWindowDays: raw === '' ? 7 : Number(raw) })
                 },
               }),
             ),

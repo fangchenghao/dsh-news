@@ -1,6 +1,6 @@
 {
   "name": "@fffangchenghao/dsh-news",
-  "version": "0.15.0",
+  "version": "0.15.1",
   "type": "module",
   "description": "为 DeepSeek Harness 与 ChatGPT 桌面版聚合 AI 信息源，按兴趣筛选并生成每日中文简报。",
   "main": "./index.js",

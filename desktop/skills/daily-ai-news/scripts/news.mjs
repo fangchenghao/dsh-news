@@ -4,7 +4,7 @@ import path from 'node:path';
 import { text } from 'node:stream/consumers';
 import { pathToFileURL } from 'node:url';
 import {
-  buildFilterPrompt, buildMarkdown, createRuntime, isDateString, localDateString,
+  buildFilterPrompt, buildMarkdown, createRuntime, digestRevision, isDateString, localDateString,
   parseFilterResponse, redactSecrets, sanitizeSummary,
 } from '../../../runtime.mjs';
 
@@ -37,39 +37,34 @@ async function readJSON(file) {
   return JSON.parse(await fs.readFile(file, 'utf8'));
 }
 
-function ready(digest) {
-  return { status: 'ready', date: digest.date, totals: digest.totals };
-}
-
-function editionKey(digest) {
-  return digest ? digest.generatedAt || 'legacy' : null;
+function ready(date, digest, superseded = false) {
+  return { status: 'ready', date, totals: digest.totals, ...(superseded ? { superseded: true } : {}) };
 }
 
 async function publish(runtime, state, selected) {
   const { batch, baseline } = state;
-  // 抓取、筛选可能跨越多个回合。保留期间其他聊天或 Harness 已经完成的新版本。
-  const latest = await runtime.readDigest(batch.date);
-  if (latest && editionKey(latest) !== baseline) return ready(latest);
   const digest = runtime.desktop.assembleDigest(batch, selected, batch.candidates.length ? 'llm' : 'no-candidates');
-  await runtime.desktop.save(digest);
-  return ready(digest);
+  const saved = await runtime.desktop.save(digest, baseline);
+  return ready(batch.date, saved.digest, saved.superseded);
 }
 
 async function prepare(runtime, refresh) {
-  const date = runtime.today();
+  const start = runtime.desktop.now();
+  const date = localDateString(start);
   const previous = await runtime.readDigest(date);
-  if (previous && !refresh) return ready(previous);
+  if (previous && !refresh) return ready(date, previous);
   const config = await runtime.loadConfig();
-  const batch = await runtime.desktop.collectCandidates(config);
+  const batch = await runtime.desktop.collectCandidates(config, start);
+  const baseline = digestRevision(previous);
+  const duringFetch = await runtime.desktop.supersedingEdition(date, baseline);
+  if (duringFetch) return ready(date, duringFetch, true);
   // 源地址可能带有私有订阅参数，阅读与模型判断只需要源的名称和抓取状态。
   batch.sourceReports = batch.sourceReports.map((report) => ({
     ...report, url: '', error: redactSecrets(report.error),
   }));
   batch.errors = batch.errors.map(redactSecrets);
-  const baseline = batch.date === date ? previous : await runtime.readDigest(batch.date);
-  if (baseline && !refresh) return ready(baseline);
   const state = {
-    batch, baseline: editionKey(baseline),
+    batch, baseline,
     config: { interests: config.interests, exploreRatio: config.exploreRatio, maxItems: config.maxItems },
   };
   if (!batch.candidates.length) return publish(runtime, state, { items: [], dropped: [] });
@@ -87,6 +82,8 @@ async function prepare(runtime, refresh) {
 async function review(runtime, run) {
   const dir = runDirectory(runtime, run);
   const state = await readJSON(path.join(dir, 'batch.json'));
+  const newer = await runtime.desktop.supersedingEdition(state.batch.date, state.baseline);
+  if (newer) return ready(state.batch.date, newer, true);
   const verdicts = await readJSON(path.join(dir, 'decisions.json'));
   const count = state.batch.candidates.length;
   if (!Array.isArray(verdicts) || verdicts.length !== count ||
@@ -101,6 +98,8 @@ async function review(runtime, run) {
   const materials = await runtime.desktop.materials(selected.items, state.batch.errors, state.batch.date);
   const pending = materials.filter((item) => !item.cached);
   if (!pending.length) return publish(runtime, state, selected);
+  const duringFetch = await runtime.desktop.supersedingEdition(state.batch.date, state.baseline);
+  if (duringFetch) return ready(state.batch.date, duringFetch, true);
   const next = await createStage(runtime, 'selection', { ...state, selected });
   const file = path.join(next.dir, 'materials.jsonl');
   await fs.writeFile(file, pending.map((item) => JSON.stringify(item)).join('\n') + '\n', { mode: 0o600 });
@@ -113,6 +112,8 @@ async function review(runtime, run) {
 async function finish(runtime, selection) {
   const dir = runDirectory(runtime, selection);
   const state = await readJSON(path.join(dir, 'selection.json'));
+  const newer = await runtime.desktop.supersedingEdition(state.batch.date, state.baseline);
+  if (newer) return ready(state.batch.date, newer, true);
   const rows = await readJSON(path.join(dir, 'summaries.json'));
   const pending = new Map(state.selected.items.filter((item) => !item.summary).map((item) => [item.id, item]));
   if (!Array.isArray(rows) || rows.length !== pending.size) throw new Error('摘要数量与待总结的条目数不符');
@@ -152,7 +153,8 @@ export async function runCommand(args, runtime = createRuntime(), input = proces
   throw new Error('用法：news.mjs prepare [--refresh] | review RUN | finish SELECTION | read [YYYY-MM-DD|yesterday] | interests [--stdin]');
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
+const entry = process.argv[1];
+if (import.meta.main ?? (entry && import.meta.url === pathToFileURL(await fs.realpath(entry).catch(() => entry)).href)) {
   try {
     const result = await runCommand(process.argv.slice(2));
     console.log(typeof result === 'string' ? result : JSON.stringify(result));

@@ -26,7 +26,11 @@ function makeReact() {
     useEffect: (fn) => effects.push(fn),
     useCallback: (fn) => fn,
     useMemo: (fn) => fn(),
-    useRef: (value) => ({ current: value }),
+    useRef: (value) => {
+      const i = hookIndex++
+      if (!(i in states)) states[i] = { current: value }
+      return states[i]
+    },
     __begin: () => { hookIndex = 0; effects.length = 0 },
     __runEffects: () => { for (const fn of effects) { try { fn() } catch { /* 忽略异步副作用 */ } } },
     __reset: () => { hookIndex = 0; states = []; effects.length = 0 },
@@ -162,4 +166,53 @@ test('客户端：设置页渲染出品味档案与重新学习入口', async ()
   const text = JSON.stringify(tree, (k, v) => (typeof v === 'function' ? '[fn]' : v))
   assert.match(text, /品味档案/)
   assert.match(text, /立即重新学习/)
+})
+
+test('设置保存只发编辑过的字段，保留桌面聊天及保存期间的修改', async () => {
+  let config = { ...state.config }
+  let submitted
+  let release
+  const hold = new Promise((resolve) => { release = resolve })
+  const reads = []
+  const { React, store } = loadModule(async (url, init) => {
+    if (url.endsWith('/config')) {
+      submitted = JSON.parse(init.body)
+      await hold
+      config = { ...config, ...submitted }
+    } else {
+      reads.push(url)
+    }
+    return { ...state, config }
+  })
+  function find(node, predicate) {
+    if (!node || typeof node !== 'object') return
+    if (predicate(node)) return node
+    for (const child of node.children) {
+      const found = find(child, predicate)
+      if (found) return found
+    }
+  }
+  const render = () => { React.__begin(); return store['settings.section'].comp({}) }
+  const number = (tree) => find(tree, (el) => el.type === 'input' && el.props.max === 100)
+  const time = (tree) => find(tree, (el) => el.type === 'input' && el.props.type === 'time')
+  const interest = (tree) => find(tree, (el) => el.type === 'textarea')
+  render()
+  React.__runEffects()
+  await new Promise(setImmediate)
+  number(render()).props.onChange({ target: { value: '12' } })
+  config = { ...config, interests: '桌面聊天刚保存的兴趣' }
+  const save = find(render(), (el) => el.type === 'button' && el.children.includes('保存'))
+  const pending = save.props.onClick()
+  time(render()).props.onChange({ target: { value: '09:30' } })
+  release()
+  await pending
+  assert.deepEqual(reads, ['/api/dsh-news/state?view=settings'])
+  assert.deepEqual(submitted, { maxItems: 12 })
+  const screen = render()
+  assert.equal(number(screen).props.value, 12)
+  assert.equal(time(screen).props.value, '09:30')
+  assert.equal(interest(screen).props.value, config.interests)
+  number(screen).props.onChange({ target: { value: '' } })
+  await find(render(), (el) => el.type === 'button' && el.children.includes('保存')).props.onClick()
+  assert.deepEqual(submitted, { maxItems: 25, dailyTime: '09:30' })
 })

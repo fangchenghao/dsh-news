@@ -1,6 +1,6 @@
 {
   "name": "dsh-news",
-  "version": "0.15.0",
+  "version": "0.15.1",
   "description": "在桌面聊天中抓取 AI 新闻，按兴趣筛选、总结并保存每日简报。",
   "author": { "name": "fangchenghao" },
   "homepage": "https://github.com/fangchenghao/dsh-news",
