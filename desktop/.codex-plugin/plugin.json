@@ -1,0 +1,15 @@
+{
+  "name": "dsh-news",
+  "version": "0.15.0",
+  "description": "在桌面聊天中抓取 AI 新闻，按兴趣筛选、总结并保存每日简报。",
+  "author": { "name": "fangchenghao" },
+  "homepage": "https://github.com/fangchenghao/dsh-news",
+  "license": "MIT",
+  "skills": "./skills/",
+  "requires_local_executor": true,
+  "interface": {
+    "displayName": "每日 AI 简报",
+    "shortDescription": "抓取订阅源，用当前对话的模型筛选和总结",
+    "defaultPrompt": ["按我的兴趣整理今天的 AI 新闻", "查看昨天的 AI 简报"]
+  }
+}

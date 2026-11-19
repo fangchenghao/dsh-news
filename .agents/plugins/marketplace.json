@@ -1,0 +1,12 @@
+{
+  "name": "dsh-news-plugins",
+  "interface": { "displayName": "DSH News" },
+  "plugins": [
+    {
+      "name": "dsh-news",
+      "source": { "source": "local", "path": "./desktop" },
+      "policy": { "installation": "AVAILABLE", "authentication": "ON_INSTALL" },
+      "category": "Productivity"
+    }
+  ]
+}

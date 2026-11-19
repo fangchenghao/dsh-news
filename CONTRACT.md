@@ -102,6 +102,8 @@ interface Digest {
 }
 ```
 
+桌面聊天与 Harness 共用上述 Digest 格式和本地日期。Harness 继续写入 `digest/YYYY-MM-DD.{json,md}`，桌面聊天将包含 Markdown 的 JSON 原子写到 `chatgpt/digest/YYYY-MM-DD.json`。查询同一天时按 `generatedAt` 读取最新版本，历史去重考虑两个入口该日保留的所有稿件。旧版 JSON 缺少 Markdown 时，查询仍可读取配套的 `.md` 文件。
+
 ## 4. Config
 
 ```ts

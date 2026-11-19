@@ -17,5 +17,7 @@ jobs:
         run: |
           node --check index.js
           node --check client.js
+          node --check desktop/runtime.mjs
+          node --check desktop/skills/daily-ai-news/scripts/news.mjs
       - name: 单元测试（不联网，不需要 curl/git）
-        run: node --test test/host.test.mjs test/client.smoke.test.mjs
+        run: npm test

@@ -2,14 +2,16 @@
 
 把十几个 AI 信息源抓下来，**由模型判断哪些值得你花时间**，再逐条写清「这条讲了什么」。
 
-界面分两处：
+ChatGPT 桌面版在本地 Work 或 Codex 聊天里使用。DeepSeek Harness 提供两个界面。
 
 - **侧边栏「每日简报」** → 完整阅读界面（日期可前后翻、按分类成文、被滤掉的条目可展开看理由、信息源状态、复制 Markdown、重新生成）
 - **设置 →「每日简报」** → 只管配置（兴趣描述、信息源、时间、代理、模型）
 
 ## 安装
 
-这是一个 DeepSeek Harness 插件（bundle）。装进当前 profile：
+### DeepSeek Harness
+
+在当前 profile 运行以下安装命令。
 
 ```
 plugin_manager install_bundle   target=/absolute/path/to/dsh-news
@@ -20,14 +22,27 @@ plugin_manager install_bundle   target=/absolute/path/to/dsh-news
 > 包名 `@local/dsh-news` 是本机 profile 里用的名字（未发布到 npm）；
 > 仓库里的 `cordis.patch.yml` 会把插件行 `dsh-news-digest` 插进 profile 组合。
 
+### ChatGPT 桌面版
+
+在安装了 Node.js 22+、curl 和 Codex CLI 的电脑上，从仓库根目录运行以下命令。保留该目录作为本地插件市场。
+
+```bash
+codex plugin marketplace add .
+codex plugin add dsh-news@dsh-news-plugins
+```
+
+在 ChatGPT 桌面版开启新的**本地 Work 或 Codex 聊天**，输入 `@` 选择「每日 AI 简报」，然后说「按我的兴趣整理今天的 AI 新闻」。也可以说「查看昨天的简报」、「重新抓取并筛选今天的新闻」或「以后优先看开源模型和有实测数据的工程文章」。普通请求会复用当天的归档。抓取、去重、探索配额和历史记录与 Harness 共用，桌面插件按聊天请求运行。 [本地插件说明](https://developers.openai.com/plugins/deploy/desktop-only)
+
+用 ChatGPT 账户登录时，当前聊天的模型直接完成筛选和摘要，计入相应的套餐用量，无需配置模型 API 密钥。Harness 定时任务仍使用其宿主配置的模型。单独调用 OpenAI API 适用 API 平台计费，部分符合条件的 Pro 和 Business 订阅可领取独立的 API 赠金。 [Work 与 Codex 的用量说明](https://help.openai.com/en/articles/20001275-chatgpt-work-and-codex) · [API 赠金说明](https://help.openai.com/en/articles/20001626-api-credits-benefit-for-eligible-chatgpt-subscriptions)
+
 ## 开发
 
 ```bash
 node --check index.js && node --check client.js
-npm test   # 离线运行宿主和阅读界面测试
+npm test   # 离线运行宿主、阅读界面和桌面插件测试
 ```
 
-- `index.js` 宿主半体：抓取 / 解析 / 模型筛选 / 逐条摘要 / 定时 / HTTP 路由
+- `index.js` 是 Harness 的入口，两个宿主共用的抓取、筛选、归档逻辑在 `desktop/runtime.mjs`，桌面聊天的分步命令在 `desktop/skills/daily-ai-news/scripts/news.mjs`。
 - `client.js` 浏览器半体：侧边栏图标 + 阅读面板 + 设置页（三个 slot 注册）
 - `CONTRACT.md` 两半之间的唯一契约（HTTP + 数据结构），也记录了历次审查踩到的坑
 
@@ -46,8 +61,12 @@ npm test   # 离线运行宿主和阅读界面测试
   config.json             兴趣描述 / 源 / 时间 / 代理 / 模型
   digest/2026-11-03.json  当天完整结果（含被滤掉的条目与理由）
   digest/2026-11-03.md    当天简报全文（Markdown，可直接复制/存档）
-  cache/summaries.json    逐条摘要缓存（30 天，按条目 id）
+  chatgpt/digest/YYYY-MM-DD.json  桌面聊天生成的归档，含 Markdown 全文
+  cache/chatgpt/          聊天本轮使用的候选和素材，之后整理新闻时清理超过 7 天的任务
+  cache/summaries.json    Harness 的逐条摘要缓存（30 天），桌面版也可复用
 ```
+
+两个入口都使用 0.15.0 或更高版本时，均可读取对方的简报。如果同日都生成过，按完成时间展示较新的一份。可通过 `DSH_NEWS_HOME` 更换共用的数据目录。
 
 ## 内置的 18 个源
 
