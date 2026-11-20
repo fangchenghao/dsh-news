@@ -1,6 +1,6 @@
 {
   "name": "@local/dsh-news",
-  "version": "0.13.0",
+  "version": "0.13.1",
   "private": true,
   "type": "module",
   "description": "每天聚合 AI 信息源，由模型判断留弃并逐条总结；带阅读界面、反馈学习与探索位。DeepSeek Harness 插件。",

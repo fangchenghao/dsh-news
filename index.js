@@ -45,7 +45,7 @@ import { fileURLToPath } from 'node:url';
 
 export const PACKAGE_ID = '@local/dsh-news';
 /** 代码版本：`/api/dsh-news/state` 会回传，用来判断宿主是否已加载新版。 */
-export const CODE_VERSION = '0.13.0';
+export const CODE_VERSION = '0.13.1';
 export const SECTION_NAME = 'plugin:dsh-news-digest';
 export const SECTION_ORDER = 160;
 
@@ -3014,6 +3014,15 @@ export function createRuntime(options = {}) {
     const local = await localRevision();
     if (!local.ok) return { ok: false, error: `这个安装不是 git 检出，无法自动更新：${local.error}` };
     if (local.dirty) return { ok: false, error: '插件目录有未提交的本地改动，先处理干净再更新' };
+
+    // 必须在 main 上更新：在特性分支里 pull main 可能变成合并或直接失败
+    const branch = await git(['rev-parse', '--abbrev-ref', 'HEAD']);
+    if (branch.ok && branch.out !== 'main') {
+      const switched = await git(['checkout', 'main']);
+      if (!switched.ok) {
+        return { ok: false, error: `当前在分支 ${branch.out}，切回 main 失败：${switched.error}` };
+      }
+    }
     const proxyMode = parseProxyMode(config?.proxy);
     const proxy = proxyMode.mode === 'proxy' ? proxyMode.url : proxyMode.mode === 'direct' ? '' : await detectProxy().catch(() => '');
     const args = ['-c', 'user.name=dsh-news-updater', '-c', 'user.email=updater@users.noreply.github.com'];
