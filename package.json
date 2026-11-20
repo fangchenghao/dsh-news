@@ -1,9 +1,8 @@
 {
-  "name": "@local/dsh-news",
-  "version": "0.13.1",
-  "private": true,
+  "name": "@fffangchenghao/dsh-news",
+  "version": "0.15.2",
   "type": "module",
-  "description": "每天聚合 AI 信息源，由模型判断留弃并逐条总结；带阅读界面、反馈学习与探索位。DeepSeek Harness 插件。",
+  "description": "为 DeepSeek Harness 与 ChatGPT 桌面版聚合 AI 信息源，按兴趣筛选并生成每日中文简报。",
   "main": "./index.js",
   "exports": {
     ".": "./index.js",
@@ -13,6 +12,8 @@
   },
   "files": [
     "index.js",
+    "desktop/",
+    ".agents/plugins/marketplace.json",
     "client.js",
     "cordis.patch.yml",
     "locale/*.json",
@@ -47,6 +48,10 @@
     "digest"
   ],
   "scripts": {
-    "test": "node --test test/host.test.mjs test/client.smoke.test.mjs"
-  }
+    "test": "node --test test/host.test.mjs test/client.smoke.test.mjs test/desktop.test.mjs"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "private": true
 }

@@ -1,6 +1,6 @@
 # dsh-news 契约（host 半体 ↔ client 半体）
 
-包名 `@local/dsh-news`，插件行 id `dsh-news-digest`。
+包名 `@fffangchenghao/dsh-news`，插件行 id `dsh-news-digest`。
 宿主侧 `index.js`，浏览器侧 `client.js`。两边**只通过下面这份 HTTP + 数据结构约定耦合**，各自独立实现。
 
 ## 1. 文件布局（运行时）
@@ -23,6 +23,8 @@
 | 方法 | 路径 | 用途 |
 |---|---|---|
 | GET | `/api/dsh-news/state` | 一次性读全量：config + 当天 digest + 运行状态 |
+| GET | `/api/dsh-news/state?view=status` | 阅读面板轮询，返回 `{ok, running, lastError}`，直接读取内存状态 |
+| GET | `/api/dsh-news/state?view=settings` | 设置页读取 `{ok, config, taste: {voteCount, profile}, proxyDetected, digestDir}` |
 | POST | `/api/dsh-news/refresh` | 立即重新抓取并生成（force）。生成中重复调用返回 `{ok:true, busy:true}` |
 | POST | `/api/dsh-news/config` | 保存配置，body 为 `Partial<Config>` |
 | POST | `/api/dsh-news/source/test` | body `{url, type}`，保存前试拉一次，返回条目标题样本 |
@@ -49,6 +51,7 @@
 
 - 成功：`{ ok: true, digest: <Digest> }`
 - 生成中：`{ ok: true, busy: true }`
+- 阅读面板发送 `Prefer: respond-async` 时，新任务立即返回 HTTP 202 和 `{ok:true, running:true}`。面板轮询至 `running:false`，成功后读取简报，失败时展示 `lastError`。其他客户端可继续使用同步响应。
 - 失败：`{ ok: false, error: "人话原因" }`
 
 `POST /api/dsh-news/config`：成功 `{ ok: true, config: <Config> }`；校验失败 `{ ok: false, error: "..." }`（如 `dailyTime` 不是 `HH:mm`）。
@@ -68,6 +71,7 @@ interface DigestItem {
   publishedAt: string   // ISO 或 ""（源没给时间）
   excerpt: string       // 源摘要，已去 HTML、截断 400 字符
   summary: string       // ★ 逐条中文总结（"这条讲了什么"，2–3 句）
+  summaryBasis?: 'excerpt' // 仅有标题和源摘录时写入，供再次生成时重试正文
   reason: string        // 模型为什么保留它（一句话，引用用户兴趣点）
 }
 
@@ -90,15 +94,20 @@ interface SourceReport {
 interface Digest {
   date: string                  // YYYY-MM-DD，本地时区
   generatedAt: string           // ISO
+  revision?: string             // 每次生成的新修订号，旧简报沿用生成时间识别
   items: DigestItem[]           // 已按分类聚好序，保留项
   dropped: DroppedItem[]        // 被模型滤掉的（透明展示，最多 50 条）
   sources: SourceReport[]
-  totals: { fetched: number; kept: number; dropped: number; summarized: number }
+  totals: { fetched: number; kept: number; dropped: number; summarized: number } // fetched 为进入筛选的候选数，原始抓取数见 sources[].count
   errors: string[]              // 全局问题（如 "宿主 llm 服务不可用，未做筛选"）
-  filterMode: 'llm' | 'fallback' // llm = 模型判断；fallback = 模型不可用，按时间倒序全留
+  filterMode: 'llm' | 'fallback' | 'no-candidates' // no-candidates 表示抓取成功，所有条目都已过期或已推送
   markdown: string              // 给人读的全文（client 的"复制 Markdown"直接用）
 }
 ```
+
+桌面聊天与 Harness 共用上述 Digest 格式和本地日期。Harness 继续写入 `digest/YYYY-MM-DD.{json,md}`，桌面聊天将包含 Markdown 的 JSON 原子写到 `chatgpt/digest/YYYY-MM-DD.json`。查询同一天时按 `generatedAt` 读取最新版本，历史去重考虑两个入口该日保留的所有稿件。旧版 JSON 缺少 Markdown 时，查询仍可读取配套的 `.md` 文件。
+
+从 0.15.1 起，两个入口按提交顺序保存同日简报。系统时钟落后或两次生成落在同一毫秒时，新提交的 `generatedAt` 取上一版时间加一毫秒。桌面聊天在筛选或总结期间发现另一入口已提交新版时，直接读取已完成的归档。
 
 ## 4. Config
 
@@ -197,7 +206,7 @@ tick 逻辑：取本地 `HH:mm`，等于 `config.dailyTime` 且当天 digest 文
 
 约定：
 
-- 阅读界面与设置页都不缓存数据，各自挂载时读 `/api/dsh-news/state`；
+- 阅读界面挂载时读 `/api/dsh-news/state`。设置页读 `?view=settings`，保存时只提交用户改过的配置字段，以保留另一个入口刚保存的修改。
 - 阅读界面翻到别的日期时读 `/api/dsh-news/digest?date=`，没有那天就显示空态（不是错误）；
 - 生成中宿主返回 `{ok:false, busy:true}`，客户端按「排队中」处理，轮询 `state.running` 变 false 再刷新；
 - 样式一律用主题 token（`--dsw-alias-*`），类名统一 `rssnews_` 前缀，深浅色都靠 token 而不是写死颜色。
@@ -233,6 +242,8 @@ arXiv（300）**各 0 条**——官网/blog 类低频源在结构上被挤出�
 5. `sanitizeSummary()`：模型给要点列表时保留换行（统一成 `· `，最多 6 行），上限 400 → 700；
    阅读界面 `.rssnews_itemBody` 用 `white-space: pre-line` 渲染；
 6. 缓存键加代际盐 `SUMMARY_CACHE_SALT`，改提示词或抓取策略时换盐，旧摘要自动失效。
+
+0.14.0 可同时处理最多 6 篇待抓取或待总结的稿件，其中最多 3 篇使用摘要模型。正文先就绪的稿件可以先生成摘要，结果仍按简报中的原顺序排列。模型路由不可用时，有效的缓存摘要也可直接展示。
 
 ## 12. 论文源与单源可达上限（0.4.0 起）
 
@@ -279,6 +290,8 @@ Google News 给的是 `news.google.com/rss/articles/...` 聚合链接，原始�
 都用前一半候选重试一次——0.4.1 时只对「截断」重试，遇到「找不到 JSON 数组」直接退化成兜底模式，
 等于当天完全没做编辑筛选（2026-11-11 就是这个情况）。
 
+0.14.0 中，超过 12 条候选且模型输出截断、为空或无法解析时，全部候选分成两批并发重试。每批的序号独立解析，再映射回原位置。失败的批次记录原因，另一批的有效判断继续使用。模型服务报错或超时会直接走降级路径。
+
 ## 15. 反馈 → 品味 → 探索（0.5.0 起）
 
 提示词调参有天花板：它只能表达「静态偏好」，学不会「英伟达产业链动态值得看、但同一人的私生活绯闻不值得」这种带边界的判断。这一版把**用户反馈**接进链路，形成闭环。
@@ -290,10 +303,12 @@ Google News 给的是 `news.google.com/rss/articles/...` 聚合链接，原始�
 ```
 { version:1,
   votes: { "<itemId>": { vote:'up'|'down', at, title, source, category, reason } },
-  profile: { text, updatedAt, basedOn } }
+  profile: { text, updatedAt, throughVoteAt, basedOn } }
 ```
 
 `profile.text` 是模型从反馈里蒸馏出的**可迁移判据**（不是记住标题），注入筛选 prompt，优先级高于用户手写的兴趣描述。
+
+从 0.15.1 起，`basedOn` 记录本次交给模型的反馈数，最多 40 条。`throughVoteAt` 是该批次最新的投票时间，读取旧档案时沿用 `updatedAt`。提炼期间新增的票计入下一轮。撤销或修改原有投票、复原档案时，迟到的学习结果会丢弃。
 
 ### 三个环节
 
@@ -307,12 +322,12 @@ Google News 给的是 `news.google.com/rss/articles/...` 聚合链接，原始�
    - 领域闸门 `isExplorationDomain()`：AI 垂类源（openai-news / anthropic-news / deepmind / google-ai /
      hf-blog / arxiv / claude-code-releases / qbitai / synced-review）直接放行；其余源要求标题或摘要命中
      AI/科技/科学词表（`智能` 对智能手机、智能手表等做负向排除）。
-   - 通过闸门后再让模型挑「主题分散、跳出口味」的几条（`buildExplorePrompt`），模型失败才退回启发式排序。
+   - 通过闸门后再让模型挑「主题分散、跳出口味」的几条（`buildExplorePrompt`）。模型明确返回空选择时保留空位，调用失败或响应无效才使用启发式排序。
    - 结果：旅游、生活方式、娱乐八卦不会出现在探索位。
    这些条目从被滤掉的池子里按**来源/分类新颖度 + 信息量**打分，用当天日期做种子（同一天结果稳定），
    标记 `explore: true`，界面显示「探索」徽章。不探索就会收敛：越学越窄，最后每天都是同一类。
 
-`GET /api/dsh-news/state` 返回 `taste: { votes, voteCount, profile }`，设置页据此显示品味档案与「立即重新学习」。
+`GET /api/dsh-news/state` 返回 `taste: { votes, voteCount, profile }` 供阅读页显示逐条投票。设置页通过 `?view=settings` 获取反馈总数和品味档案。
 
 ## 16. 一次外部代码审查的结果（0.7.0）
 
@@ -439,8 +454,9 @@ id，因为 URL 稳定）每天都会被重新推一次，投票自然跟着复�
 | `maxAgeDays` | 3 | 发布时间早于 N 天前的条目直接丢弃（0 = 不限制）。没有发布时间的条目保留——很多 feed 不带 date |
 | `repeatWindowDays` | 7 | 最近 N 天的简报里出现过的条目不再进候选（0 = 不限制）。**按 id 和归一化标题双重匹配**，换 URL 转载也挡得住 |
 
-实现：`filterFreshness()` / `filterRepeats()` 两个纯函数，在 `prepareCandidates` 之后、模型筛选之前执行，
-被过滤的条数写进 `errors`（用户能在「运行提示」里看到）。
+自 0.14.0 起，先按发布时间过滤，再按 URL 和带版本号的标题键去重、排除历史条目，最后才分配单源与全局候选名额。历史窗口按任务开始时的本地日历日期回溯。过滤数量记入 `errors`，每个源的抓取数量保存在 `sources[].count`。
+
+当各源都成功、抓到了条目且全部已过期或已推送，插件保存 `no-candidates` 简报，定时器当天即可结束。若各源均返回零条，或部分源失败且没有可用的新稿，生成仍报错并保留重试机会。
 
 用 11-18 的真实数据验证：25 条里有 3 条超龄（其中 1 条是 2025 年的），再叠加 7 天重复过滤又跳过 1 条，
 最终 21 条。设置页两项都可调，设 0 即恢复旧行为。
@@ -481,7 +497,7 @@ id，因为 URL 稳定）每天都会被重新推一次，投票自然跟着复�
 2. `readArticleBody` 手动逐跳跟随（最多 `MAX_ARTICLE_REDIRECTS = 5`），**每一跳**都用
    `resolveRedirect()` 解析绝对地址、校验协议（只允许 http/https）、再用 `isPrivateUrl()/isLoopbackUrl()`
    拦内网——跳到内网立即放弃整篇；
-3. 抓不到正文的条数写进 `errors`：「N 条没有抓到正文（只按标题与源摘要生成）」。
+3. `errors` 记录有多少条摘要生成时仅有标题与源摘录。从 0.15.1 起，这些摘要带 `summaryBasis: 'excerpt'`，再次生成时会重试原文。多个 Harness 共用数据目录时会合并各自的新缓存，同条新闻优先保留有正文依据的摘要。
 
 实测（2026-11-19 的 25 条）：修复前 DeepMind / 爱范儿等大批条目正文为空；修复后 **22/25 条抓到正文**
 （2599–2600 字），只有 3 条抓不到——2 条是 Google News 的聚合跳转链接，1 条是 OpenAI News（反爬）。

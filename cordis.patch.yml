@@ -2,4 +2,4 @@
 # 浏览器半体在 设置 →「每日简报」 里渲染当天结果与配置。
 - insert:
     - id: dsh-news-digest
-      name: '@local/dsh-news'
+      name: '@fffangchenghao/dsh-news'
